@@ -1,0 +1,162 @@
+{
+  "name": "naparnik-1c-chat",
+  "displayName": "Напарник",
+  "description": "Неофициальный чат с 1С:Напарник.",
+  "version": "0.3.3",
+  "publisher": "winst0niuss",
+  "license": "MIT",
+  "icon": "media/marketplace-icon.png",
+  "galleryBanner": {
+    "color": "#1F6FEB",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "naparnik",
+          "title": "Напарник. Неофициальный чат-бот 1С",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "naparnik": [
+        {
+          "type": "webview",
+          "id": "naparnik.chat",
+          "name": "Напарник. Неофициальный чат-бот 1С"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "naparnik.newChat",
+        "title": "Новый чат",
+        "category": "1С:Напарник",
+        "icon": "$(add)"
+      },
+      {
+        "command": "naparnik.showHistory",
+        "title": "История чатов",
+        "category": "1С:Напарник",
+        "icon": "$(history)"
+      },
+      {
+        "command": "naparnik.setToken",
+        "title": "Задать токен",
+        "category": "1С:Напарник",
+        "icon": "$(key)"
+      },
+      {
+        "command": "naparnik.clearToken",
+        "title": "Удалить токен",
+        "category": "1С:Напарник"
+      },
+      {
+        "command": "naparnik.askAboutSelection",
+        "title": "Спросить Напарника о выделенном коде",
+        "category": "1С:Напарник"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "naparnik.newChat",
+          "when": "view == naparnik.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "naparnik.showHistory",
+          "when": "view == naparnik.chat",
+          "group": "navigation@2"
+        },
+        {
+          "command": "naparnik.setToken",
+          "when": "view == naparnik.chat",
+          "group": "navigation@3"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "naparnik.askAboutSelection",
+          "when": "editorHasSelection",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "1С:Напарник",
+      "properties": {
+        "naparnik.baseUrl": {
+          "type": "string",
+          "default": "https://code.1c.ai",
+          "description": "Базовый URL API 1С:Напарник"
+        },
+        "naparnik.authFormat": {
+          "type": "string",
+          "enum": [
+            "plain",
+            "bearer"
+          ],
+          "default": "plain",
+          "description": "Формат заголовка Authorization: токен как есть (plain) или 'Bearer <токен>'"
+        },
+        "naparnik.skillName": {
+          "type": "string",
+          "enum": [
+            "custom",
+            "raw"
+          ],
+          "default": "custom",
+          "description": "custom — модель может искать в ИТС и документации платформы; raw — только ответ модели"
+        },
+        "naparnik.timeoutSeconds": {
+          "type": "number",
+          "default": 120,
+          "description": "Таймаут одного HTTP-запроса (сек)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "npm run compile && node --test \"out/test/**/*.test.js\"",
+    "package": "vsce package",
+    "publish:vscode": "vsce publish",
+    "publish:openvsx": "npx ovsx publish"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "~1.90.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.4.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/winst0niuss/naparnik-1c-vscode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/winst0niuss/naparnik-1c-vscode/issues"
+  },
+  "homepage": "https://github.com/winst0niuss/naparnik-1c-vscode#readme",
+  "keywords": [
+    "1c",
+    "1с",
+    "bsl",
+    "naparnik",
+    "напарник",
+    "chat",
+    "ai"
+  ]
+}

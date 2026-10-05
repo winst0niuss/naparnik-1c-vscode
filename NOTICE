@@ -1,0 +1,36 @@
+naparnik-1c-vscode — неофициальное расширение VS Code для сервиса 1С:Напарник.
+
+Проект не связан с фирмой «1С» и не одобрен ею. «1С», «1С:Предприятие»,
+«1С:Напарник» — товарные знаки ООО «1С-Софт»; они используются только
+для указания совместимости.
+
+Код расширения написан с нуля на TypeScript. Сведения о формате запросов
+и ответов API 1С:Напарник взяты из открытых проектов:
+
+- 1c-ai-mcp — https://github.com/Desko77/1c-ai-mcp
+  Лицензия MIT. Copyright (c) 2025 авторы 1c-ai-mcp.
+  Разбор SSE-ответа и подтверждение tool_calls (src/api/sseParser.ts,
+  src/api/client.ts) повторяют логику его модуля src/onec_api_client.py.
+
+- spring-mcp-1c-copilot — https://github.com/SteelMorgan/spring-mcp-1c-copilot
+  Использованы только сведения о формате API, код не заимствован.
+
+Текст лицензии MIT проекта 1c-ai-mcp:
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.

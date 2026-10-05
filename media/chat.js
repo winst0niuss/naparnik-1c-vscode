@@ -263,7 +263,10 @@
         setStatus('Напарник думает', THINK_FRAMES);
         break;
       case 'toolCalls':
-        if (currentStatus) setStatus('Ищу: ' + msg.names.map(humanToolName).join(', '), SEARCH_FRAMES);
+        if (!currentStatus) break;
+        // План задач модели — не поиск
+        if (msg.names.every((n) => n === 'TodoWrite')) setStatus('Составляю план', THINK_FRAMES);
+        else setStatus('Ищу: ' + msg.names.filter((n) => n !== 'TodoWrite').map(humanToolName).join(', '), SEARCH_FRAMES);
         break;
       case 'assistantText':
         if (!currentAnswer) break;
@@ -458,6 +461,7 @@
       Search_Documentation: 'документация платформы',
       Diff_Documentation_Versions: 'изменения между версиями',
       validate: 'проверка синтаксиса',
+      TodoWrite: 'план задач',
     };
     const short = String(name).split('__').pop();
     return map[short] || short;

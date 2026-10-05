@@ -169,3 +169,11 @@ test('строка «@read_file …» внутри текста файла не 
     { kind: 'create_file', path: 'NAPARNIK.md', content: '# Команды\n@read_file путь — прочитать файл\n@search текст\nКонец' },
   ]);
 });
+
+test('«@end» в той же строке, что и команда чтения, — не часть пути', () => {
+  assert.deepEqual(parseCommands('@read_file service-a/README.md @end\n@list_dir src @end\n@search Dockerfile @end'), [
+    { kind: 'read_file', path: 'service-a/README.md' },
+    { kind: 'list_dir', path: 'src' },
+    { kind: 'search', query: 'Dockerfile', glob: undefined },
+  ]);
+});

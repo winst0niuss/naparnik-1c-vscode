@@ -199,3 +199,9 @@ test('таймаут считается по паузе в данных: мед�
     server.close();
   }
 });
+
+test('TodoWrite и инструменты поиска разрешены, инструменты 1С:EDT — нет', async () => {
+  const { isUsableServerTool } = await import('../api/client');
+  for (const n of ['TodoWrite', 'mcp__knowledge-hub__Search_ITS', 'mcp__syntax-checker__validate']) assert.ok(isUsableServerTool(n), n);
+  for (const n of ['WriteSystemFile', 'GetObject_in_Project', 'Task', undefined]) assert.ok(!isUsableServerTool(n), String(n));
+});

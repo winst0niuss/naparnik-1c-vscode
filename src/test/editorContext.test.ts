@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { EditorSnapshot, SECRET_FILE, contextLabel, formatEditorContext } from '../agent/editorContext';
+import { EditorSnapshot, contextLabel, formatEditorContext } from '../agent/editorContext';
 
 const base: EditorSnapshot = {
   path: 'src/Documents/Заказ/Ext/ObjectModule.bsl',
@@ -41,7 +41,3 @@ test('файл вне проекта, обрезка большого файла
   assert.ok(md.includes('````markdown\n'), 'обрамление длиннее, чем ``` внутри текста');
 });
 
-test('секреты не прикладываются', () => {
-  for (const p of ['/p/.env', '/p/.env.local', '/p/certs/server.pem', '/home/u/.ssh/id_rsa']) assert.ok(SECRET_FILE.test(p), p);
-  for (const p of ['/p/src/Module.bsl', '/p/README.md', '/p/environment.ts']) assert.ok(!SECRET_FILE.test(p), p);
-});

@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import { realpath } from 'node:fs/promises';
 import { AgentCommand, ProjectContext, applySearchReplace } from './protocol';
 import { PROJECT_DOC_DIRS, PROJECT_DOC_FILES, RULES_DIR } from '../slashCommands';
-import { SECRET_FILE } from './editorContext';
+import { globToRegExp, parseGitignore } from './gitignore';
 
 const MAX_FILE_CHARS = 60_000;
 // Документация прикладывается к первому сообщению, только если она короткая
@@ -15,7 +15,9 @@ const MAX_SEARCH_RESULTS = 50;
 const MAX_SEARCH_FILES = 5_000;
 // Большие файлы (выгрузки XML, логи) при поиске пропускаем — иначе поиск идёт минутами
 const MAX_SEARCH_FILE_BYTES = 1_000_000;
-const IGNORED_DIRS = new Set(['.git', 'node_modules', 'out', 'dist', '.vscode-test']);
+const TREE_MAX_LINES = 250;
+const TREE_MAX_DEPTH = 4;
+const TREE_FULL_DEPTH = 12;
 
 /** Решение пользователя по предложенной правке. signal — запрос остановили, ждать решения больше не нужно */
 export type ConfirmEdit = (
@@ -50,7 +52,7 @@ export class WorkspaceTools {
     try {
       switch (cmd.kind) {
         case 'list_dir':
-          return await this.listDir(cmd.path);
+          return await this.listDir(cmd.path, cmd.depth);
         case 'read_file':
           return await this.readFile(cmd.path);
         case 'search':
@@ -61,47 +63,102 @@ export class WorkspaceTools {
           return await this.createFile(cmd.path, cmd.content);
       }
     } catch (err) {
+      // Понятное модели сообщение вместо «EntryNotFound (FileSystemError)…»
+      if (err instanceof vscode.FileSystemError && err.code === 'FileNotFound') {
+        return `Ошибка: не найдено — ${'path' in cmd ? cmd.path : ''}. Сверься с картой проекта или найди через @search.`;
+      }
       return `Ошибка: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
 
   /**
-   * Дерево проекта для первого сообщения: небольшой проект — целиком (модели не нужно ходить по папкам),
-   * большой (например, выгрузка конфигурации) — только два верхних уровня.
+   * Карта проекта для первого сообщения.
+   * Небольшой проект — целиком (модули форм 1С лежат на 6–7 уровнях). Большой — самое глубокое дерево
+   * до 4 уровней, которое помещается в лимит строк; в больших папках — первые элементы и «… ещё N».
+   * Так видны все папки верхнего уровня, а не только первая большая, съевшая весь бюджет строк.
    */
   async tree(): Promise<{ text: string; complete: boolean }> {
-    const full = await this.buildTree(8, 200);
-    return full.truncated ? { text: (await this.buildTree(2, 150)).text, complete: false } : { text: full.text, complete: true };
+    const full = await this.buildTree(this.root, TREE_FULL_DEPTH, TREE_MAX_LINES, false);
+    if (!full.overflow) return { text: full.text, complete: !full.truncated };
+    for (const depth of [TREE_MAX_DEPTH, 3, 2]) {
+      const result = await this.buildTree(this.root, depth, TREE_MAX_LINES);
+      if (!result.overflow) return { text: result.text, complete: false };
+    }
+    const { text } = await this.buildTree(this.root, 1, Infinity);
+    return { text, complete: false };
   }
 
-  private async buildTree(depth: number, maxLines: number): Promise<{ text: string; truncated: boolean }> {
+  /**
+   * overflow — дерево не поместилось в maxLines (обход прерван); truncated — что-то свёрнуто в «… ещё N».
+   * limitPerDir — показывать в больших папках только первые элементы (для сокращённой карты).
+   */
+  private async buildTree(
+    start: vscode.Uri,
+    depth: number,
+    maxLines: number,
+    limitPerDir = true,
+  ): Promise<{ text: string; truncated: boolean; overflow: boolean }> {
     let truncated = false;
+    let overflow = false;
     const lines: string[] = [];
+    // Корень показываем шире, вложенные папки — первыми элементами: однотипные объекты 1С понятны по нескольким
+    const perDir = (level: number) => (!limitPerDir ? Infinity : level === 0 ? 60 : level === 1 ? 25 : 12);
     const walk = async (uri: vscode.Uri, level: number) => {
-      if (lines.length >= maxLines) return;
       const entries = await this.sortedEntries(uri);
-      for (const [name, type] of entries) {
+      for (let i = 0; i < entries.length; i++) {
         if (lines.length >= maxLines) {
-          lines.push('  '.repeat(level) + '…');
+          overflow = true;
+          return;
+        }
+        const indent = '  '.repeat(level);
+        if (i >= perDir(level)) {
+          const dirs = entries.slice(i).filter(([, t]) => t === vscode.FileType.Directory).length;
+          lines.push(`${indent}… ещё ${entries.length - i} (папок: ${dirs})`);
           truncated = true;
           return;
         }
+        const [name, type] = entries[i];
         const isDir = type === vscode.FileType.Directory;
-        lines.push('  '.repeat(level) + name + (isDir ? '/' : ''));
+        lines.push(indent + name + (isDir ? '/' : ''));
         if (isDir && level + 1 < depth) {
           await walk(vscode.Uri.joinPath(uri, name), level + 1);
+        } else if (isDir) {
+          truncated = true; // глубже не смотрели
         }
       }
     };
-    await walk(this.root, 0);
-    return { text: lines.join('\n') || '(папка пуста)', truncated };
+    await walk(start, 0);
+    return { text: lines.join('\n') || '(папка пуста)', truncated: truncated || overflow, overflow };
+  }
+
+  /**
+   * Файлы проекта для поиска. Обходим папки сами, не заходя в игнорируемые: иначе большая папка
+   * из .gitignore (зависимости, сборка) съела бы лимит файлов раньше, чем дойдёт очередь до кода.
+   */
+  private async collectFiles(match: RegExp | undefined, limit: number): Promise<vscode.Uri[]> {
+    const files: vscode.Uri[] = [];
+    const queue: vscode.Uri[] = [this.root];
+    while (queue.length > 0 && files.length < limit) {
+      const dir = queue.shift()!;
+      for (const [name, type] of await this.sortedEntries(dir)) {
+        const uri = vscode.Uri.joinPath(dir, name);
+        if (type & vscode.FileType.Directory) queue.push(uri);
+        else if (!match || match.test(this.relative(uri))) files.push(uri);
+        if (files.length >= limit) break;
+      }
+    }
+    return files;
   }
 
   /** Документация, инструкции ИИ-инструментов и правила из .rules — для первого сообщения */
   async projectContext(): Promise<ProjectContext> {
     const docs: string[] = [];
-    for (const rel of PROJECT_DOC_FILES) {
-      if (await this.exists(vscode.Uri.joinPath(this.root, rel))) docs.push(rel);
+    // Корень и папки первого уровня: в папке может лежать несколько проектов со своими README/CLAUDE.md
+    const bases = ['', ...(await this.sortedEntries(this.root)).filter(([, t]) => t === vscode.FileType.Directory).map(([n]) => n + '/')];
+    for (const base of bases) {
+      for (const rel of PROJECT_DOC_FILES) {
+        if (await this.exists(vscode.Uri.joinPath(this.root, base + rel))) docs.push(base + rel);
+      }
     }
     for (const dir of PROJECT_DOC_DIRS) {
       docs.push(...(await this.markdownFilesIn(dir, 20)));
@@ -112,8 +169,9 @@ export class WorkspaceTools {
     let total = 0;
     for (const rel of docs) {
       const text = await this.readText(vscode.Uri.joinPath(this.root, rel)).catch(() => '');
-      const limit = rel === 'NAPARNIK.md' ? MAX_ATTACHED_TOTAL_CHARS : MAX_ATTACHED_DOC_CHARS;
-      if (!text || (text.length > limit && rel !== 'NAPARNIK.md') || total + Math.min(text.length, limit) > MAX_ATTACHED_TOTAL_CHARS) continue;
+      const isOwnDescription = rel === 'NAPARNIK.md'; // только корневой — описание этого проекта
+      const limit = isOwnDescription ? MAX_ATTACHED_TOTAL_CHARS : MAX_ATTACHED_DOC_CHARS;
+      if (!text || (text.length > limit && !isOwnDescription) || total + Math.min(text.length, limit) > MAX_ATTACHED_TOTAL_CHARS) continue;
       attached.push({ path: rel, text: text.slice(0, limit) });
       total += Math.min(text.length, limit);
     }
@@ -161,8 +219,13 @@ export class WorkspaceTools {
     return found;
   }
 
-  private async listDir(relPath: string): Promise<string> {
+  private async listDir(relPath: string, depth = 1): Promise<string> {
     const uri = await this.resolve(relPath);
+    if (depth > 1) {
+      const { text, overflow } = await this.buildTree(uri, Math.min(depth, TREE_MAX_DEPTH), 300);
+      const note = overflow ? '\n(показана часть — для подробностей смотри вложенные папки отдельно)' : '';
+      return `Дерево ${relPath} (глубина ${depth}):\n${text}${note}`;
+    }
     const entries = await this.sortedEntries(uri);
     const shown = entries.slice(0, MAX_DIR_ENTRIES).map(([name, type]) => name + (type === vscode.FileType.Directory ? '/' : ''));
     const more = entries.length > MAX_DIR_ENTRIES ? `\n… ещё ${entries.length - MAX_DIR_ENTRIES}` : '';
@@ -171,8 +234,8 @@ export class WorkspaceTools {
 
   private async readFile(relPath: string): Promise<string> {
     const uri = await this.resolve(relPath);
-    if (SECRET_FILE.test(this.relative(uri))) {
-      throw new Error(`${relPath} может содержать секреты — чтение запрещено`);
+    if ((await vscode.workspace.fs.stat(uri)).type & vscode.FileType.Directory) {
+      return `${relPath} — это папка, а не файл. ${await this.listDir(relPath, 2)}`;
     }
     const text = await this.readText(uri);
     if (text.length > MAX_FILE_CHARS) {
@@ -182,11 +245,7 @@ export class WorkspaceTools {
   }
 
   private async search(query: string, glob?: string): Promise<string> {
-    const files = await vscode.workspace.findFiles(
-      new vscode.RelativePattern(this.root, glob || '**/*'),
-      `**/{${[...IGNORED_DIRS].join(',')}}/**`,
-      MAX_SEARCH_FILES,
-    );
+    const files = await this.collectFiles(glob ? globToRegExp(glob) : undefined, MAX_SEARCH_FILES);
     const needle = query.toLowerCase();
     const results: string[] = [];
 
@@ -197,7 +256,7 @@ export class WorkspaceTools {
       if (rel.toLowerCase().includes(needle)) {
         results.push(`${rel} (совпадение в пути)`);
       }
-      if (SECRET_FILE.test(rel)) continue;
+
       let text: string;
       try {
         if ((await vscode.workspace.fs.stat(file)).size > MAX_SEARCH_FILE_BYTES) continue;
@@ -264,14 +323,48 @@ export class WorkspaceTools {
     return vscode.Uri.file(full);
   }
 
+  /*
+   * Что скрыто, решает проект, а не расширение: только то, что игнорирует git.
+   * Учитываются .gitignore во всех папках (как в git — каждый относительно своей папки) и сама папка .git,
+   * которую git никогда не считает частью проекта. Своих списков папок в коде нет.
+   * Скрытые пути не видны в карте проекта и поиске, но явно прочитать их можно.
+   */
+  private readonly gitignores = new Map<string, Promise<RegExp[]>>();
+
+  private async isIgnored(rel: string): Promise<boolean> {
+    const parts = rel.split('/');
+    if (parts.includes('.git')) return true;
+    // Проверяем путь .gitignore каждой папки-предка: корня, затем вложенных
+    for (let i = 0; i < parts.length; i++) {
+      const dir = parts.slice(0, i).join('/');
+      const relToDir = parts.slice(i).join('/');
+      if (!this.gitignores.has(dir)) this.gitignores.set(dir, this.loadGitignore(dir));
+      if ((await this.gitignores.get(dir)!).some((re) => re.test(relToDir))) return true;
+    }
+    return false;
+  }
+
+  private async loadGitignore(dir: string): Promise<RegExp[]> {
+    try {
+      const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(this.root, dir, '.gitignore')));
+      return parseGitignore(text);
+    } catch {
+      return [];
+    }
+  }
+
   private relative(uri: vscode.Uri): string {
     return path.relative(this.root.fsPath, uri.fsPath).split(path.sep).join('/');
   }
 
   private async sortedEntries(uri: vscode.Uri): Promise<[string, vscode.FileType][]> {
     const entries = await vscode.workspace.fs.readDirectory(uri);
-    return entries
-      .filter(([name]) => !IGNORED_DIRS.has(name))
+    const base = this.relative(uri);
+    const visible: [string, vscode.FileType][] = [];
+    for (const entry of entries) {
+      if (!(await this.isIgnored(base ? `${base}/${entry[0]}` : entry[0]))) visible.push(entry);
+    }
+    return visible
       .sort(([a, ta], [b, tb]) => (ta === tb ? a.localeCompare(b) : ta === vscode.FileType.Directory ? -1 : 1));
   }
 

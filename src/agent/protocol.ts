@@ -5,7 +5,7 @@
  */
 
 export type AgentCommand =
-  | { kind: 'list_dir'; path: string }
+  | { kind: 'list_dir'; path: string; depth?: number }
   | { kind: 'read_file'; path: string }
   | { kind: 'search'; query: string; glob?: string }
   | { kind: 'edit_file'; path: string; edits: SearchReplace[] }
@@ -38,7 +38,9 @@ function renderContext(ctx: ProjectContext): string {
         ctx.rules.map((r) => `--- ${r.path} ---\n${r.text.trim()}`).join('\n\n'),
     );
   }
-  if (ctx.docs.length > 0) {
+  if (ctx.docs.length === 0) {
+    parts.push('Документации (README и т. п.) и инструкций для ИИ-инструментов (CLAUDE.md, AGENTS.md…) в проекте нет — не ищи их, изучай код.');
+  } else {
     const attachedPaths = new Set(ctx.attached.map((a) => a.path));
     const rest = ctx.docs.filter((d) => !attachedPaths.has(d));
     parts.push(
@@ -69,7 +71,7 @@ export function buildAgentPrompt(
 Чтобы выполнить команды, ответь ТОЛЬКО командами, каждая с новой строки, без пояснений. Можно несколько команд в одном ответе.
 
 Чтение:
-@list_dir ПАПКА — содержимое папки ("." — корень проекта)
+@list_dir ПАПКА | ГЛУБИНА — дерево папки ("." — корень проекта; глубина 1–4, по умолчанию 1)
 @read_file ФАЙЛ — текст файла
 @search ТЕКСТ | МАСКА — поиск текста по файлам; « | МАСКА» необязательна, пример: @search Сообщить | **/*.bsl
 
@@ -86,8 +88,13 @@ export function buildAgentPrompt(
 полный текст нового файла
 @end
 
+Экономь шаги — их число ограничено:
+- В одном ответе отправляй сразу все нужные команды: например, 5–10 @read_file подряд, а не по одному файлу за ответ.
+- Структура проекта ниже уже показана — не смотри повторно то, что в ней видно. Чтобы увидеть глубже, используй @list_dir ПАПКА | 3.
+- @read_file — только для файлов; папки смотри через @list_dir.
+
 Правила:
-- Для файлов проекта используй ТОЛЬКО эти @-команды. Инструменты WriteSystemFile, ReadSystemFile, GetObject_in_Project, FindRelated_in_Project, FindSimilar_in_Project, Task, TodoWrite здесь не работают (нет сессии 1С:EDT). Поиск по ИТС и документации платформы использовать можно.
+- Для файлов проекта используй ТОЛЬКО эти @-команды. Инструменты WriteSystemFile, ReadSystemFile, GetObject_in_Project, FindRelated_in_Project, FindSimilar_in_Project, Task здесь не работают (нет сессии 1С:EDT). Поиск по ИТС и документации платформы использовать можно.
 - Не используй XML-теги — только строки с @.
 - Пути — относительно корня проекта, через "/". НЕ угадывай пути: сначала @list_dir или @search.
 - В выгрузке конфигурации 1С модули лежат так: <Тип>/<Имя>/Ext/ObjectModule.bsl, ManagerModule.bsl, Module.bsl (общие модули), Forms/<Форма>/Ext/Form/Module.bsl.
@@ -120,10 +127,17 @@ function parseLineCommands(text: string): AgentCommand[] {
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(LINE_COMMAND);
     if (!m) continue;
-    const [, kind, rawArg] = m;
+    // Модель часто дописывает «@end» в ту же строку: «@read_file a.md @end» — это не часть пути
+    const [, kind] = m;
+    const rawArg = m[2].replace(/\s*@end\s*$/, '');
     const arg = unquote(rawArg);
 
-    if (kind === 'list_dir' || kind === 'read_file') {
+    if (kind === 'list_dir') {
+      // «@list_dir src | 3» — дерево папки на несколько уровней одной командой
+      const [dir, depthRaw] = rawArg.split(/\s+\|\s+/).map(unquote);
+      const depth = Math.min(Math.max(Number(depthRaw) || 1, 1), 4);
+      commands.push(depth > 1 ? { kind, path: dir || '.', depth } : { kind, path: dir || '.' });
+    } else if (kind === 'read_file') {
       commands.push({ kind, path: arg || '.' });
     } else if (kind === 'search') {
       const [query, glob] = rawArg.split(/\s+\|\s+/).map(unquote);
@@ -275,7 +289,7 @@ export function applySearchReplace(original: string, edits: SearchReplace[]): st
 export function describeCommand(cmd: AgentCommand): string {
   switch (cmd.kind) {
     case 'list_dir':
-      return `📂 Смотрю ${cmd.path === '.' ? 'корень проекта' : cmd.path}`;
+      return `📂 Смотрю ${cmd.path === '.' ? 'корень проекта' : cmd.path}${cmd.depth ? ` (${cmd.depth} ур.)` : ''}`;
     case 'read_file':
       return `📄 Читаю ${cmd.path}`;
     case 'search':

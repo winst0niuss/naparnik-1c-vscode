@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { EditorDiagnostic, EditorSnapshot, SECRET_FILE, contextLabel } from './agent/editorContext';
+import { EditorDiagnostic, EditorSnapshot, contextLabel } from './agent/editorContext';
 
 /**
  * Следит за последним текстовым редактором пользователя.
@@ -108,10 +108,9 @@ export class EditorContextTracker implements vscode.Disposable {
   }
 }
 
-/** Обычный файл или несохранённый документ; служебные документы (Output, diff Напарника, git) и секреты — нет */
+/** Обычный файл или несохранённый документ; служебные документы (Output, diff Напарника, git) — нет */
 export function supported(editor: vscode.TextEditor | undefined): boolean {
   if (!editor) return false;
   const uri = editor.document.uri;
-  if (uri.scheme !== 'file' && uri.scheme !== 'untitled') return false;
-  return !SECRET_FILE.test(uri.path);
+  return uri.scheme === 'file' || uri.scheme === 'untitled';
 }

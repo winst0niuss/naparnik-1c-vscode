@@ -3,17 +3,14 @@ import { createHash } from 'node:crypto';
 import { NaparnikClient } from './api/client';
 import { TokenStore } from './tokenStore';
 import { ChatHistory, SavedChat, createChat, makeTitle } from './chatHistory';
-import {
-  AGENT_UNAVAILABLE_TOOL_HINT,
-  MAX_AGENT_STEPS,
-  buildAgentPrompt,
-  describeCommand,
-  findUnfinishedWrite,
-  looksLikeMalformedEdit,
-  MALFORMED_EDIT_HINT,
-  parseCommands,
-  stripCommandsForDisplay,
-} from './agent/protocol';
+import { AgentCommand, MAX_AGENT_STEPS, buildAgentPrompt, findUnfinishedWrite, stripCommandsForDisplay } from './agent/protocol';
+import { runAgentLoop } from './agent/agentLoop';
+
+/** /init выполнен, только если NAPARNIK.md создан или изменён */
+function initDone(executed: AgentCommand[]): string | undefined {
+  const written = executed.some((c) => (c.kind === 'create_file' || c.kind === 'edit_file') && /(^|\/)NAPARNIK\.md$/i.test(c.path));
+  return written ? undefined : 'Задача не выполнена: NAPARNIK.md ещё не создан. Если информации достаточно — создай его командой @create_file NAPARNIK.md … @end; если нет — дочитай нужное командами.';
+}
 import { INIT_PROMPT, MAKE_RULES_PROMPT, RULES_DIR, SLASH_COMMANDS, helpText, parseSlash } from './slashCommands';
 import { WorkspaceTools } from './agent/workspaceTools';
 import { EditPreview, PendingEdit } from './agent/editPreview';
@@ -21,6 +18,8 @@ import { EditorContextTracker } from './editorContextTracker';
 import { contextLabel, formatEditorContext } from './agent/editorContext';
 
 const PROJECT_ACCESS_KEY = 'naparnik.projectAccess';
+// Лимит шагов для /init и /make-rules: им нужно изучить проект, обычному вопросу — нет
+const EXPLORE_MAX_STEPS = 25;
 const PROJECT_CONSENT_KEY = 'naparnik.projectAccessConsent';
 
 /** Сообщения из webview в расширение */
@@ -43,8 +42,6 @@ interface RunningRequest {
   // Состояние стрима, чтобы показать его при возврате в чат
   partial: string;
   toolNames?: string[];
-  /** Модели уже напомнили формат правки — второй раз не напоминаем, чтобы не зациклиться */
-  formatReminded?: boolean;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -284,14 +281,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'init':
         if (await this.ensureProjectAccess('/init')) {
-          await this.send('/init', INIT_PROMPT, false);
+          // Изучение проекта требует больше шагов, чем обычный вопрос
+          await this.send('/init', INIT_PROMPT, false, EXPLORE_MAX_STEPS, initDone);
         }
         break;
       case 'make-rules':
         if (this.chat.entries.length === 0) {
           this.info('В этом чате пока нечего записывать: `/make-rules` собирает правила из уже состоявшегося разговора.');
         } else if (await this.ensureProjectAccess('/make-rules')) {
-          await this.send('/make-rules', MAKE_RULES_PROMPT, false);
+          await this.send('/make-rules', MAKE_RULES_PROMPT, false, EXPLORE_MAX_STEPS);
         }
         break;
       case 'rules':
@@ -426,7 +424,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * withEditorContext: true — приложить открытый файл, если пользователь не выключил чип;
    * 'force' — приложить в любом случае (пользователь явно спросил о выделенном).
    */
-  private async send(text: string, modelText?: string, withEditorContext: boolean | 'force' = false): Promise<void> {
+  private async send(
+    text: string,
+    modelText?: string,
+    withEditorContext: boolean | 'force' = false,
+    maxSteps = MAX_AGENT_STEPS,
+    checkDone?: (executed: AgentCommand[]) => string | undefined,
+  ): Promise<void> {
     text = text.trim();
     // В одном чате — один запрос за раз; в других чатах можно спрашивать параллельно
     if (!text) {
@@ -496,60 +500,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       chat.agentPaused = chat.agentPrimed && !tools;
 
       // Агентный цикл: ответ с командами → выполняем → отправляем результат → снова ответ
-      for (let step = 0; ; step++) {
-        const answer = await client.sendMessage(
-          chat.conversationId,
-          message,
-          chat.lastAssistantUuid,
-          {
-            onText: (partial) => {
-              run.partial = chat.agentPrimed ? stripCommandsForDisplay(partial) : partial;
-              // Модель пишет содержимое файла — вместе с текстом передаём прогресс, чтобы показать его вместо «думает»
-              const writing = chat.agentPrimed ? findUnfinishedWrite(partial) : undefined;
-              postIfVisible({ type: 'assistantText', text: run.partial, writing });
-            },
-            onToolCalls: (names) => {
-              run.toolNames = names;
-              postIfVisible({ type: 'toolCalls', names });
-            },
-            unavailableToolHint: tools ? AGENT_UNAVAILABLE_TOOL_HINT : undefined,
-          },
-          run.abort.signal,
-        );
-        chat.lastAssistantUuid = answer.assistantUuid;
-
-        const commands = tools ? parseCommands(answer.text) : [];
-        // Правка без @edit_file — один раз напоминаем формат, а не показываем блок как ответ
-        if (tools && commands.length === 0 && looksLikeMalformedEdit(answer.text) && !run.formatReminded && step < MAX_AGENT_STEPS) {
-          run.formatReminded = true;
-          run.partial = '';
-          postIfVisible({ type: 'assistantText', text: '' });
-          message = MALFORMED_EDIT_HINT;
-          continue;
-        }
-        if (commands.length === 0) {
-          chat.entries.push({ role: 'assistant', text: answer.text });
-          postIfVisible({ type: 'assistantDone', text: answer.text });
-          this.notifyIfHidden(chat);
-          break;
-        }
-        if (step >= MAX_AGENT_STEPS) {
-          throw new Error(`Напарник не уложился в ${MAX_AGENT_STEPS} шагов. Попробуйте уточнить вопрос.`);
-        }
-
-        const results: string[] = [];
-        for (const cmd of commands) {
-          const description = describeCommand(cmd);
+      const answer = await runAgentLoop({
+        client,
+        conversationId: chat.conversationId,
+        parentUuid: chat.lastAssistantUuid,
+        message,
+        tools,
+        maxSteps,
+        checkDone,
+        signal: run.abort.signal,
+        onText: (partial) => {
+          run.partial = chat.agentPrimed ? stripCommandsForDisplay(partial) : partial;
+          // Модель пишет содержимое файла — вместе с текстом передаём прогресс, чтобы показать его вместо «думает»
+          const writing = chat.agentPrimed ? findUnfinishedWrite(partial) : undefined;
+          postIfVisible({ type: 'assistantText', text: run.partial, writing });
+        },
+        onToolCalls: (names) => {
+          run.toolNames = names;
+          postIfVisible({ type: 'toolCalls', names });
+        },
+        onRejectedTools: (names) => {
+          const description = `⛔ Недоступно вне 1С:EDT: ${names.join(', ')}`;
           chat.entries.push({ role: 'step', text: description });
           postIfVisible({ type: 'step', text: description });
-          results.push(`### ${description}\n${await tools!.run(cmd)}`);
-          // Пока пользователь смотрел diff, запрос могли остановить
-          if (run.abort.signal.aborted) throw new Error('Остановлено');
-        }
-        run.partial = '';
-        postIfVisible({ type: 'assistantText', text: '' });
-        message = `Результаты команд:\n\n${results.join('\n\n')}`;
-      }
+        },
+        onStep: (description) => {
+          chat.entries.push({ role: 'step', text: description });
+          postIfVisible({ type: 'step', text: description });
+        },
+        onNextRound: () => {
+          run.partial = '';
+          postIfVisible({ type: 'assistantText', text: '' });
+        },
+      });
+      chat.lastAssistantUuid = answer.assistantUuid;
+      chat.entries.push({ role: 'assistant', text: answer.text });
+      postIfVisible({ type: 'assistantDone', text: answer.text });
+      this.notifyIfHidden(chat);
     } catch (err) {
       const message = run.abort.signal.aborted ? 'Остановлено' : errorMessage(err);
       chat.entries.push({ role: 'error', text: message });

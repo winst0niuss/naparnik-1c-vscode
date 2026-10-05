@@ -5,7 +5,6 @@ import { findTokenProblem } from './api/client';
 import { ChatHistory } from './chatHistory';
 import { EditPreview } from './agent/editPreview';
 import { EditorContextTracker, supported } from './editorContextTracker';
-import { SECRET_FILE } from './agent/editorContext';
 
 export function activate(context: vscode.ExtensionContext): void {
   const tokens = new TokenStore(context.secrets);
@@ -66,10 +65,6 @@ export function activate(context: vscode.ExtensionContext): void {
         value: 'Объясни этот код',
       });
       if (!question?.trim()) {
-        return;
-      }
-      if (SECRET_FILE.test(editor.document.uri.path)) {
-        void vscode.window.showWarningMessage('Этот файл может содержать секреты — Напарнику он не отправляется.');
         return;
       }
       if (supported(editor)) {

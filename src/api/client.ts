@@ -19,14 +19,19 @@ export interface StreamCallbacks {
   onToolCalls?: (toolNames: string[]) => void;
   /** Пояснение для модели, когда она вызывает недоступный инструмент (например, инструменты 1С:EDT) */
   unavailableToolHint?: string;
+  /** Модель вызвала инструменты, которые мы отклонили (инструменты 1С:EDT) */
+  onRejectedTools?: (toolNames: string[]) => void;
 }
 
 // Инструменты сервиса, которые работают без 1С:EDT. Остальные (WriteSystemFile, GetObject_in_Project…)
 // требуют сессии EDT и без неё падают — такие вызовы отклоняем
 const USABLE_SERVER_TOOLS = ['mcp__knowledge-hub__', 'mcp__syntax-checker__', 'mcp__web__'];
+// План задач модели: сервер выполняет его сам, без 1С:EDT (проверено). Отклонять его — лишние запросы,
+// а модель вызывает его часто: 10 отказов подряд упирались в лимит раундов
+const USABLE_SERVER_TOOL_NAMES = new Set(['TodoWrite']);
 
 export function isUsableServerTool(name: string | undefined): boolean {
-  return Boolean(name && USABLE_SERVER_TOOLS.some((prefix) => name.startsWith(prefix)));
+  return Boolean(name && (USABLE_SERVER_TOOL_NAMES.has(name) || USABLE_SERVER_TOOLS.some((prefix) => name.startsWith(prefix))));
 }
 
 const DEFAULT_UNAVAILABLE_HINT = 'Инструмент недоступен: работа идёт не из 1С:EDT, сессии проекта нет. Ответь без него.';
@@ -159,6 +164,10 @@ export class NaparnikClient {
       const usable = accepted.filter((tc) => isUsableServerTool(tc.function?.name));
       if (usable.length > 0) {
         callbacks.onToolCalls?.(usable.map(toolName));
+      }
+      const rejected = accepted.filter((tc) => !isUsableServerTool(tc.function?.name));
+      if (rejected.length > 0) {
+        callbacks.onRejectedTools?.(rejected.map(toolName));
       }
 
       payload = {

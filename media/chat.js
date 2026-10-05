@@ -9,6 +9,7 @@
   const stopBtn = document.getElementById('stop');
   const tokenBanner = document.getElementById('token-banner');
   const projectToggle = document.getElementById('project-toggle');
+  const editorChip = document.getElementById('editor-chip');
 
   // Блок ответа, который сейчас стримится
   let currentAnswer = null;
@@ -116,6 +117,7 @@
 
   stopBtn.addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
   projectToggle.addEventListener('click', () => vscode.postMessage({ type: 'toggleProject' }));
+  editorChip.addEventListener('click', () => vscode.postMessage({ type: 'toggleEditorContext' }));
   document.getElementById('set-token').addEventListener('click', () => vscode.postMessage({ type: 'setToken' }));
 
   // Кнопки у блоков кода — через делегирование, блоки создаются динамически
@@ -141,7 +143,7 @@
         currentStatus = null;
         setBusy(false);
         for (const entry of msg.history) {
-          if (entry.role === 'user') addUser(entry.text);
+          if (entry.role === 'user') addUser(entry.text, entry.context);
           else if (entry.role === 'assistant') addMessage('assistant').innerHTML = renderMarkdown(entry.text);
           else if (entry.role === 'step') addStep(entry.text);
           else addError(entry.text);
@@ -151,6 +153,15 @@
         stopStatus();
         messagesEl.innerHTML = '';
         setBusy(false);
+        break;
+      case 'editorContext':
+        // Чип: какой файл (и выделение) уйдёт со следующим сообщением; клик — выключить/включить
+        editorChip.classList.toggle('hidden', !msg.label);
+        editorChip.classList.toggle('off', !msg.enabled);
+        editorChip.textContent = '📄 ' + (msg.label || '');
+        editorChip.title = msg.enabled
+          ? 'Файл ' + msg.path + ' будет приложен к сообщению. Нажмите, чтобы не прикладывать'
+          : 'Файл не прикладывается. Нажмите, чтобы приложить';
         break;
       case 'commands':
         commands = msg.list || [];
@@ -211,7 +222,7 @@
         if (currentStatus) setStatus('Напарник думает', THINK_FRAMES);
         break;
       case 'userMessage':
-        addUser(msg.text);
+        addUser(msg.text, msg.context);
         break;
       case 'assistantStart':
         setBusy(true);
@@ -308,8 +319,15 @@
     return el;
   }
 
-  function addUser(text) {
-    addMessage('user').innerHTML = renderMarkdown(text);
+  function addUser(text, context) {
+    const el = addMessage('user');
+    el.innerHTML = renderMarkdown(text);
+    if (context) {
+      const ctx = document.createElement('div');
+      ctx.className = 'user-context';
+      ctx.textContent = '📄 ' + context;
+      el.appendChild(ctx);
+    }
   }
 
   function addStep(text, before) {

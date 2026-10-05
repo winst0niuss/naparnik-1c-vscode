@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import { realpath } from 'node:fs/promises';
 import { AgentCommand, ProjectContext, applySearchReplace } from './protocol';
 import { PROJECT_DOC_DIRS, PROJECT_DOC_FILES, RULES_DIR } from '../slashCommands';
+import { SECRET_FILE } from './editorContext';
 
 const MAX_FILE_CHARS = 60_000;
 // Документация прикладывается к первому сообщению, только если она короткая
@@ -15,8 +16,6 @@ const MAX_SEARCH_FILES = 5_000;
 // Большие файлы (выгрузки XML, логи) при поиске пропускаем — иначе поиск идёт минутами
 const MAX_SEARCH_FILE_BYTES = 1_000_000;
 const IGNORED_DIRS = new Set(['.git', 'node_modules', 'out', 'dist', '.vscode-test']);
-// Файлы с секретами не читаем и не ищем по ним: их содержимое ушло бы в сервис 1С:Напарник
-const SECRET_FILE = /(^|\/)(\.env(\..*)?|\.npmrc|\.netrc|id_(rsa|ed25519|ecdsa)[^/]*|[^/]+\.(pem|key|p12|pfx))$/i;
 
 /** Решение пользователя по предложенной правке. signal — запрос остановили, ждать решения больше не нужно */
 export type ConfirmEdit = (uri: vscode.Uri, original: string, proposed: string, isNew: boolean, signal?: AbortSignal) => Promise<boolean>;

@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { createHash } from 'node:crypto';
 import { NaparnikClient } from './api/client';
 import { TokenStore } from './tokenStore';
 import { ChatHistory, SavedChat, createChat, makeTitle } from './chatHistory';
@@ -16,6 +17,8 @@ import {
 import { INIT_PROMPT, MAKE_RULES_PROMPT, RULES_DIR, SLASH_COMMANDS, helpText, parseSlash } from './slashCommands';
 import { WorkspaceTools } from './agent/workspaceTools';
 import { EditPreview, PendingEdit } from './agent/editPreview';
+import { EditorContextTracker } from './editorContextTracker';
+import { contextLabel, formatEditorContext } from './agent/editorContext';
 
 const PROJECT_ACCESS_KEY = 'naparnik.projectAccess';
 const PROJECT_CONSENT_KEY = 'naparnik.projectAccessConsent';
@@ -30,6 +33,7 @@ type WebviewMessage =
   | { type: 'setToken' }
   | { type: 'toggleProject' }
   | { type: 'resolveEdit'; id: number; accepted: boolean }
+  | { type: 'toggleEditorContext' }
   | { type: 'insertCode'; code: string };
 
 /** Запрос, который выполняется в фоне — у каждого чата свой */
@@ -50,9 +54,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private chat: SavedChat = createChat();
   private running = new Map<string, RunningRequest>();
   // Сообщение, отправленное до того, как панель успела открыться
-  private pendingMessage: string | undefined;
+  private pendingMessage: { text: string; mode: 'force' | false } | undefined;
   // Правки, ждущие решения, — чтобы показать карточку снова после перерисовки чата
   private pendingEdits = new Map<number, PendingEdit>();
+  // Пользователь выключил контекст редактора кликом по чипу — до смены файла
+  private editorContextOff = false;
+  private editorContextUri: string | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -62,7 +69,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly workspaceState: vscode.Memento,
     private readonly globalState: vscode.Memento,
     private readonly preview: EditPreview,
+    private readonly editorContext: EditorContextTracker,
   ) {
+    editorContext.onDidChange(() => {
+      // Выключение действует, пока открыт тот же файл; новый файл — контекст снова включён
+      const uri = editorContext.uri?.toString();
+      if (uri !== this.editorContextUri) this.editorContextOff = false;
+      this.editorContextUri = uri;
+      this.postEditorContext();
+    });
     preview.onDidStart((edit) => {
       this.pendingEdits.set(edit.id, edit);
       this.post({ type: 'editPending', ...edit });
@@ -84,14 +99,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     view.onDidDispose(() => (this.view = undefined));
   }
 
-  /** Отправить сообщение из кода (команда «спросить о выделенном») */
-  async ask(text: string): Promise<void> {
+  /** Вопрос о выделенном коде (контекстное меню редактора): выделение прикладывается как контекст */
+  async ask(text: string, withEditorContext = true): Promise<void> {
+    const mode = withEditorContext ? 'force' : false;
     if (this.view) {
       this.view.show(true);
-      await this.send(text);
+      await this.send(text, undefined, mode);
     } else {
       // Открываем панель; отправим, когда webview пришлёт 'ready'
-      this.pendingMessage = text;
+      this.pendingMessage = { text, mode };
       await vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
     }
   }
@@ -179,6 +195,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.pendingEdits.forEach((edit) => this.post({ type: 'editPending', ...edit }));
   }
 
+  /** Чип над полем ввода: какой файл и выделение будут приложены к следующему сообщению */
+  private postEditorContext(): void {
+    const info = this.editorContext.describe();
+    this.post({ type: 'editorContext', label: info?.label ?? null, path: info?.path, enabled: !this.editorContextOff });
+  }
+
   async refreshTokenState(): Promise<void> {
     this.post({ type: 'tokenState', hasToken: Boolean(await this.tokens.get()) });
   }
@@ -228,7 +250,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async handleInput(text: string): Promise<void> {
     const slash = parseSlash(text);
     if (!slash) {
-      await this.send(text);
+      await this.send(text, undefined, true);
       return;
     }
     switch (slash.name) {
@@ -259,14 +281,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'init':
         if (await this.ensureProjectAccess('/init')) {
-          await this.send('/init', INIT_PROMPT);
+          await this.send('/init', INIT_PROMPT, false);
         }
         break;
       case 'make-rules':
         if (this.chat.entries.length === 0) {
           this.info('В этом чате пока нечего записывать: `/make-rules` собирает правила из уже состоявшегося разговора.');
         } else if (await this.ensureProjectAccess('/make-rules')) {
-          await this.send('/make-rules', MAKE_RULES_PROMPT);
+          await this.send('/make-rules', MAKE_RULES_PROMPT, false);
         }
         break;
       case 'rules':
@@ -352,13 +374,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     switch (msg.type) {
       case 'ready':
         this.post({ type: 'commands', list: SLASH_COMMANDS });
+        this.postEditorContext();
         this.renderCurrentChat();
         this.postProjectState();
         await this.refreshTokenState();
         if (this.pendingMessage) {
-          const text = this.pendingMessage;
+          const { text, mode } = this.pendingMessage;
           this.pendingMessage = undefined;
-          await this.send(text);
+          await this.send(text, undefined, mode);
         }
         break;
       case 'send':
@@ -382,6 +405,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'resolveEdit':
         this.preview.resolve(msg.id, msg.accepted);
         break;
+      case 'toggleEditorContext':
+        this.editorContextOff = !this.editorContextOff;
+        this.postEditorContext();
+        break;
       case 'insertCode':
         await insertIntoEditor(msg.code);
         break;
@@ -392,7 +419,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * Отправить вопрос. text — то, что видит пользователь в чате и истории;
    * modelText — что уходит модели (для /init и /make-rules это развёрнутая инструкция).
    */
-  private async send(text: string, modelText?: string): Promise<void> {
+  /**
+   * withEditorContext: true — приложить открытый файл, если пользователь не выключил чип;
+   * 'force' — приложить в любом случае (пользователь явно спросил о выделенном).
+   */
+  private async send(text: string, modelText?: string, withEditorContext: boolean | 'force' = false): Promise<void> {
     text = text.trim();
     // В одном чате — один запрос за раз; в других чатах можно спрашивать параллельно
     if (!text) {
@@ -409,12 +440,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // Снимок редактора берём сразу: пока ждём ответа, пользователь может переключить файл
+    const useEditor = withEditorContext === 'force' || (withEditorContext && !this.editorContextOff);
+    const editorSnap = useEditor ? this.editorContext.snapshot() : undefined;
+    const context = editorSnap ? contextLabel(editorSnap) : undefined;
+
     // Запоминаем чат: пользователь может переключиться, а ответ должен попасть сюда
     const chat = this.chat;
     if (chat.entries.length === 0) {
       chat.title = makeTitle(text);
     }
-    chat.entries.push({ role: 'user', text });
+    chat.entries.push({ role: 'user', text, context });
     const run: RunningRequest = { chat, abort: new AbortController(), partial: '' };
     this.running.set(chat.id, run);
     // Сохраняем сразу, чтобы чат появился в истории, пока идёт ответ
@@ -424,7 +460,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const postIfVisible = (message: object) => {
       if (this.chat === chat) this.post(message);
     };
-    postIfVisible({ type: 'userMessage', text });
+    postIfVisible({ type: 'userMessage', text, context });
     postIfVisible({ type: 'assistantStart' });
 
     try {
@@ -432,7 +468,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       chat.conversationId ??= await client.createConversation(run.abort.signal);
 
       const tools = this.projectAccess ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm, run.abort.signal) : undefined;
-      const question = modelText ?? text;
+      // Контекст редактора — перед вопросом: модель сразу видит, о каком файле и фрагменте речь.
+      // Тот же неизменённый файл повторно не шлём — модель уже видела его в этом чате
+      let editorBlock = editorSnap ? formatEditorContext(editorSnap) : '';
+      // В истории храним хеш, а не сам текст файла — чтобы история чатов не разрасталась
+      const editorHash = editorBlock ? createHash('sha1').update(editorBlock).digest('hex') : undefined;
+      if (editorHash && editorHash === chat.lastEditorContext) {
+        editorBlock = `[Контекст редактора: открыт тот же файл ${editorSnap!.path}, он не изменился с прошлого сообщения]`;
+      } else if (editorHash) {
+        chat.lastEditorContext = editorHash;
+      }
+      const question = (editorBlock ? editorBlock + '\n\n' : '') + (modelText ?? text);
       let message = question;
       if (tools && !chat.agentPrimed) {
         // Первое сообщение с доступом к проекту: инструкция по командам, дерево, документация и правила
@@ -510,6 +556,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       chat.lastAssistantUuid = undefined;
       chat.agentPrimed = false;
       chat.agentPaused = false;
+      chat.lastEditorContext = undefined; // новая дискуссия на сервере файла ещё не видела
     } finally {
       this.running.delete(chat.id);
       // Удалённый во время ответа чат обратно в историю не возвращаем
@@ -559,6 +606,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <div id="messages"></div>
   <form id="composer">
     <div class="composer-tools">
+      <button type="button" id="editor-chip" class="chip hidden" title=""></button>
       <button type="button" id="project-toggle" class="toggle" title="Разрешить Напарнику смотреть и читать файлы открытого проекта">
         <span class="toggle-dot"></span>Доступ к проекту
       </button>

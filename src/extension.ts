@@ -4,10 +4,13 @@ import { TokenStore } from './tokenStore';
 import { findTokenProblem } from './api/client';
 import { ChatHistory } from './chatHistory';
 import { EditPreview } from './agent/editPreview';
+import { EditorContextTracker, supported } from './editorContextTracker';
+import { SECRET_FILE } from './agent/editorContext';
 
 export function activate(context: vscode.ExtensionContext): void {
   const tokens = new TokenStore(context.secrets);
   const preview = new EditPreview();
+  const editorContext = new EditorContextTracker();
   const chat = new ChatViewProvider(
     context.extensionUri,
     tokens,
@@ -15,10 +18,12 @@ export function activate(context: vscode.ExtensionContext): void {
     context.workspaceState,
     context.globalState,
     preview,
+    editorContext,
   );
 
   context.subscriptions.push(
     preview.register(),
+    editorContext,
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewId, chat, {
       // Не терять переписку и идущий стрим при переключении панелей
       webviewOptions: { retainContextWhenHidden: true },
@@ -53,18 +58,28 @@ export function activate(context: vscode.ExtensionContext): void {
 
     vscode.commands.registerCommand('naparnik.askAboutSelection', async () => {
       const editor = vscode.window.activeTextEditor;
-      const code = editor?.document.getText(editor.selection).trim();
-      if (!code) {
+      if (!editor || editor.selection.isEmpty) {
         return;
       }
       const question = await vscode.window.showInputBox({
         title: 'Что сделать с кодом?',
         value: 'Объясни этот код',
       });
-      if (question === undefined) {
+      if (!question?.trim()) {
         return;
       }
-      await chat.ask(`${question}\n\n\`\`\`bsl\n${code}\n\`\`\``);
+      if (SECRET_FILE.test(editor.document.uri.path)) {
+        void vscode.window.showWarningMessage('Этот файл может содержать секреты — Напарнику он не отправляется.');
+        return;
+      }
+      if (supported(editor)) {
+        // Обычный файл: выделение уйдёт как контекст редактора — с путём и номерами строк
+        await chat.ask(question);
+      } else {
+        // Служебная вкладка (Output, diff…) — контекста редактора у неё нет, вставляем код в вопрос
+        const code = editor.document.getText(editor.selection);
+        await chat.ask(`${question}\n\n\`\`\`\n${code}\n\`\`\``, false);
+      }
     }),
 
     tokens.onDidChange(() => chat.refreshTokenState()),

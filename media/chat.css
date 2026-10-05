@@ -230,7 +230,35 @@ a {
 
 .composer-tools {
   display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
   margin-bottom: 6px;
+}
+
+/* Чип контекста редактора: какой файл уйдёт со следующим сообщением */
+button.chip {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--vscode-foreground);
+  background: var(--vscode-badge-background, transparent);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 10px;
+}
+
+button.chip.off {
+  text-decoration: line-through;
+  background: transparent;
+  opacity: 0.55;
+}
+
+.user-context {
+  margin-top: 4px;
+  font-size: 11px;
+  opacity: 0.65;
 }
 
 button.toggle {

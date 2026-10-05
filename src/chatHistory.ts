@@ -5,6 +5,8 @@ export interface ChatEntry {
   // step — шаг работы с проектом («Читаю …»)
   role: 'user' | 'assistant' | 'error' | 'step';
   text: string;
+  /** Для сообщения пользователя: какой файл редактора был приложен («chatHistory.ts · строки 10–24») */
+  context?: string;
 }
 
 export interface SavedChat {
@@ -15,6 +17,8 @@ export interface SavedChat {
   /** Дискуссия на сервере — чтобы продолжить старый чат с сохранённым контекстом */
   conversationId?: string;
   lastAssistantUuid?: string;
+  /** Хеш последнего отправленного контекста редактора — чтобы не слать тот же неизменённый файл повторно */
+  lastEditorContext?: string;
   /** Модели уже отправлена инструкция по командам работы с проектом */
   agentPrimed?: boolean;
   /** Доступ к проекту выключили после инструкции — модели уже сказано не использовать команды */

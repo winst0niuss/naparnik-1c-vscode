@@ -12,7 +12,7 @@ export interface PendingEdit {
 
 /**
  * Показ предложенной правки как diff и ожидание решения пользователя.
- * Решить можно тремя способами: карточка в чате, кнопки ✓/✕ в заголовке diff, уведомление.
+ * Решить можно двумя способами: карточка в чате или кнопки ✓/✕ в заголовке diff.
  * Предложенный текст отдаётся через виртуальный документ — на диск ничего не пишется до «Применить».
  */
 export class EditPreview implements vscode.TextDocumentContentProvider {
@@ -72,15 +72,9 @@ export class EditPreview implements vscode.TextDocumentContentProvider {
     try {
       if (signal?.aborted) return false;
       const title = isNew ? `Напарник: новый файл ${name}` : `Напарник: правка ${name}`;
-      await vscode.commands.executeCommand('vscode.diff', left, right, title, { preview: true });
+      // preserveFocus: фокус остаётся в чате — Enter там сразу применяет правку
+      await vscode.commands.executeCommand('vscode.diff', left, right, title, { preview: true, preserveFocus: true });
       this.startEmitter.fire({ id, label, isNew });
-
-      // Уведомление — дополнительный способ ответить; его могут скрыть, поэтому не ждём только его
-      void vscode.window
-        .showInformationMessage(isNew ? `Напарник предлагает создать ${label}` : `Напарник предлагает изменить ${label}`, 'Применить', 'Отклонить')
-        .then((choice) => {
-          if (choice) this.resolve(id, choice === 'Применить');
-        });
 
       const accepted = await decision;
       this.endEmitter.fire({ id, accepted });

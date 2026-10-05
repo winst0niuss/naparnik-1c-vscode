@@ -2,7 +2,7 @@
   "name": "naparnik-1c-chat",
   "displayName": "Напарник",
   "description": "Неофициальный чат с 1С:Напарник.",
-  "version": "0.6.1",
+  "version": "0.6.3",
   "publisher": "winst0niuss",
   "license": "MIT",
   "icon": "media/marketplace-icon.png",
@@ -166,7 +166,19 @@
           "description": "Сколько секунд ждать данных от сервера, прежде чем прервать ответ. Считается пауза в данных, а не время всего ответа."
         }
       }
-    }
+    },
+    "keybindings": [
+      {
+        "command": "naparnik.applyEdit",
+        "key": "enter",
+        "when": "editorFocus && resourceScheme == naparnik-proposed"
+      },
+      {
+        "command": "naparnik.rejectEdit",
+        "key": "escape",
+        "when": "editorFocus && resourceScheme == naparnik-proposed && !findWidgetVisible && !suggestWidgetVisible"
+      }
+    ]
   },
   "scripts": {
     "compile": "tsc -p .",

@@ -58,9 +58,31 @@
     }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
+      // Поле пустое, а правка ждёт решения — Enter применяет её
+      const pending = pendingEditId();
+      if (!input.value.trim() && pending !== undefined) {
+        resolveEdit(pending, true);
+        return;
+      }
       form.requestSubmit();
     }
+    if (e.key === 'Escape' && !input.value.trim() && pendingEditId() !== undefined) {
+      e.preventDefault();
+      resolveEdit(pendingEditId(), false);
+    }
   });
+
+  /** Последняя правка, ждущая решения */
+  function pendingEditId() {
+    const cards = messagesEl.querySelectorAll('.edit-card:not(.resolved)');
+    return cards.length > 0 ? Number(cards[cards.length - 1].dataset.id) : undefined;
+  }
+
+  function resolveEdit(id, accepted) {
+    vscode.postMessage({ type: 'resolveEdit', id: Number(id), accepted });
+    // После решения возвращаем фокус в поле ввода
+    input.focus();
+  }
 
   // Меню показывается, пока введено только «/команда» без пробела
   input.addEventListener('input', updateMenu);
@@ -190,18 +212,26 @@
         title.textContent = (msg.isNew ? '🆕 Создать файл ' : '✏️ Изменить файл ') + msg.label + '?';
         const hint = document.createElement('div');
         hint.className = 'edit-hint';
-        hint.textContent = 'Изменения открыты во вкладке diff. Файл изменится только после «Применить».';
+        hint.textContent = 'Изменения открыты во вкладке diff. Enter — применить, Esc — отклонить.';
         const buttons = document.createElement('div');
         buttons.className = 'edit-buttons';
         buttons.innerHTML = '<button data-accept="1">Применить</button><button class="secondary" data-accept="0">Отклонить</button>';
         buttons.addEventListener('click', (e) => {
           const btn = e.target.closest('button');
           if (!btn) return;
-          vscode.postMessage({ type: 'resolveEdit', id: Number(msg.id), accepted: btn.dataset.accept === '1' });
+          resolveEdit(msg.id, btn.dataset.accept === '1');
+        });
+        card.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            resolveEdit(msg.id, false);
+          }
         });
         card.append(title, hint, buttons);
         if (currentAnswer) messagesEl.insertBefore(card, currentAnswer);
         else messagesEl.appendChild(card);
+        // Фокус на «Применить» — Enter сразу применяет. Если пользователь что-то печатает, не мешаем
+        if (!input.value.trim()) buttons.querySelector('button').focus();
         if (currentStatus) setStatus('Жду вашего решения по правке', WAIT_FRAMES);
         scrollToBottom();
         break;
@@ -240,7 +270,7 @@
         if (msg.writing && currentStatus) {
           // Модель пишет файл: его текст скрыт, под уже напечатанным текстом показываем прогресс
           const w = msg.writing;
-          setStatus((w.isNew ? 'Пишет ' : 'Готовит правку ') + w.path + ' · ' + w.chars.toLocaleString('ru-RU') + ' симв.', WRITE_FRAMES);
+          setStatus((w.isNew ? 'Пишет ' : 'Готовит правку ') + w.path + ' · ' + w.chars.toLocaleString('ru-RU') + ' ' + plural(w.chars, 'символ', 'символа', 'символов'), WRITE_FRAMES);
           currentAnswer.appendChild(currentStatus);
         } else if (!msg.text && currentStatus) {
           // Новый шаг агентного цикла: возвращаем статус вместо текста
@@ -292,13 +322,23 @@
       if (!el) return;
       const frames = el.frames || THINK_FRAMES;
       el.querySelector('.status-emoji').textContent = frames[Math.floor(tick / 2) % frames.length];
-      el.querySelector('.status-dots').textContent = '.'.repeat((tick % 3) + 1);
+      // Пока пишется файл, растёт счётчик символов — бегущие точки после него лишние
+      el.querySelector('.status-dots').textContent = frames === WRITE_FRAMES ? '' : '.'.repeat((tick % 3) + 1);
       const seconds = Math.floor((Date.now() - statusStarted) / 1000);
       el.querySelector('.status-time').textContent = seconds >= 3 ? seconds + ' с' : '';
       tick++;
     };
     render();
     statusTimer = setInterval(render, 400);
+  }
+
+  /** 1 символ, 2 символа, 5 символов */
+  function plural(n, one, few, many) {
+    const mod10 = n % 10;
+    const mod100 = n % 100;
+    if (mod10 === 1 && mod100 !== 11) return one;
+    if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return few;
+    return many;
   }
 
   function stopStatus() {

@@ -8,10 +8,16 @@
   const sendBtn = document.getElementById('send');
   const stopBtn = document.getElementById('stop');
   const tokenBanner = document.getElementById('token-banner');
+  const projectToggle = document.getElementById('project-toggle');
 
   // Блок ответа, который сейчас стримится
   let currentAnswer = null;
   let currentStatus = null;
+  // Анимация статуса «думает»: смена эмодзи, бегущие точки и секундомер — видно, что не завис
+  const THINK_FRAMES = ['🤔', '💭', '🧠', '💡'];
+  const SEARCH_FRAMES = ['🔍', '📚', '📖', '🔎'];
+  const WAIT_FRAMES = ['✋', '👀'];
+  let statusTimer = null;
 
   form.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -29,6 +35,7 @@
   });
 
   stopBtn.addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
+  projectToggle.addEventListener('click', () => vscode.postMessage({ type: 'toggleProject' }));
   document.getElementById('set-token').addEventListener('click', () => vscode.postMessage({ type: 'setToken' }));
 
   // Кнопки у блоков кода — через делегирование, блоки создаются динамически
@@ -49,21 +56,73 @@
     switch (msg.type) {
       case 'restore':
         messagesEl.innerHTML = '';
+        stopStatus();
         currentAnswer = null;
         currentStatus = null;
         setBusy(false);
         for (const entry of msg.history) {
           if (entry.role === 'user') addUser(entry.text);
           else if (entry.role === 'assistant') addMessage('assistant').innerHTML = renderMarkdown(entry.text);
+          else if (entry.role === 'step') addStep(entry.text);
           else addError(entry.text);
         }
         break;
       case 'clear':
+        stopStatus();
         messagesEl.innerHTML = '';
         setBusy(false);
         break;
       case 'tokenState':
         tokenBanner.classList.toggle('hidden', msg.hasToken);
+        break;
+      case 'projectAccess':
+        projectToggle.classList.toggle('on', msg.on);
+        projectToggle.title = !msg.available
+          ? 'Откройте папку проекта, чтобы дать Напарнику доступ к файлам'
+          : msg.on
+            ? 'Напарник видит файлы проекта. Нажмите, чтобы выключить'
+            : 'Разрешить Напарнику смотреть и читать файлы открытого проекта';
+        break;
+      case 'editPending': {
+        if (document.querySelector('.edit-card[data-id="' + msg.id + '"]')) break;
+        const card = document.createElement('div');
+        card.className = 'edit-card';
+        card.dataset.id = msg.id;
+        const title = document.createElement('div');
+        title.className = 'edit-title';
+        title.textContent = (msg.isNew ? '🆕 Создать файл ' : '✏️ Изменить файл ') + msg.label + '?';
+        const hint = document.createElement('div');
+        hint.className = 'edit-hint';
+        hint.textContent = 'Изменения открыты во вкладке diff. Файл изменится только после «Применить».';
+        const buttons = document.createElement('div');
+        buttons.className = 'edit-buttons';
+        buttons.innerHTML = '<button data-accept="1">Применить</button><button class="secondary" data-accept="0">Отклонить</button>';
+        buttons.addEventListener('click', (e) => {
+          const btn = e.target.closest('button');
+          if (!btn) return;
+          vscode.postMessage({ type: 'resolveEdit', id: Number(msg.id), accepted: btn.dataset.accept === '1' });
+        });
+        card.append(title, hint, buttons);
+        if (currentAnswer) messagesEl.insertBefore(card, currentAnswer);
+        else messagesEl.appendChild(card);
+        if (currentStatus) setStatus('Жду вашего решения по правке', WAIT_FRAMES);
+        scrollToBottom();
+        break;
+      }
+      case 'editResolved': {
+        const card = document.querySelector('.edit-card[data-id="' + msg.id + '"]');
+        if (card) {
+          card.classList.add('resolved');
+          card.querySelector('.edit-hint').remove();
+          card.querySelector('.edit-buttons').textContent = msg.accepted ? '✅ Применено' : '❌ Отклонено';
+        }
+        if (currentStatus) setStatus('Напарник думает', THINK_FRAMES);
+        break;
+      }
+      case 'step':
+        // Шаг вставляется перед блоком ответа, который сейчас печатается
+        addStep(msg.text, currentAnswer);
+        if (currentStatus) setStatus('Напарник думает', THINK_FRAMES);
         break;
       case 'userMessage':
         addUser(msg.text);
@@ -71,26 +130,31 @@
       case 'assistantStart':
         setBusy(true);
         currentAnswer = addMessage('assistant');
-        currentStatus = document.createElement('div');
-        currentStatus.className = 'status';
-        currentStatus.textContent = 'Напарник думает…';
+        currentStatus = createStatus();
         currentAnswer.appendChild(currentStatus);
+        setStatus('Напарник думает', THINK_FRAMES);
         break;
       case 'toolCalls':
-        if (currentStatus) currentStatus.textContent = 'Ищу: ' + msg.names.map(humanToolName).join(', ') + '…';
+        if (currentStatus) setStatus('Ищу: ' + msg.names.map(humanToolName).join(', '), SEARCH_FRAMES);
         break;
       case 'assistantText':
-        if (currentAnswer && msg.text) {
+        if (!currentAnswer) break;
+        if (msg.text) {
           currentAnswer.innerHTML = renderMarkdown(msg.text);
-          scrollToBottom();
+        } else {
+          // Новый шаг агентного цикла: возвращаем статус вместо текста
+          currentAnswer.innerHTML = '';
+          if (currentStatus) currentAnswer.appendChild(currentStatus);
         }
+        scrollToBottom();
         break;
       case 'assistantDone':
         if (currentAnswer) currentAnswer.innerHTML = renderMarkdown(msg.text);
         finishAnswer();
         break;
       case 'error':
-        if (currentAnswer && !currentAnswer.querySelector(':not(.status)')) currentAnswer.remove();
+        // Блок ответа без текста (только статус «думает») убираем — вместо него будет ошибка
+        if (currentAnswer && (!currentStatus || currentAnswer.contains(currentStatus))) currentAnswer.remove();
         addError(msg.message);
         finishAnswer();
         break;
@@ -98,10 +162,47 @@
   });
 
   function finishAnswer() {
+    stopStatus();
     currentAnswer = null;
     currentStatus = null;
     setBusy(false);
     scrollToBottom();
+  }
+
+  function createStatus() {
+    const el = document.createElement('div');
+    el.className = 'status';
+    el.innerHTML = '<span class="status-emoji"></span><span class="status-text"></span><span class="status-dots"></span><span class="status-time"></span>';
+    return el;
+  }
+
+  /** Текст статуса и набор эмодзи; секундомер идёт с момента начала ответа */
+  function setStatus(text, frames) {
+    if (!currentStatus) return;
+    currentStatus.querySelector('.status-text').textContent = text;
+    currentStatus.frames = frames;
+    if (statusTimer) return;
+
+    const started = Date.now();
+    let tick = 0;
+    const render = () => {
+      // Статус мог быть снят со страницы, когда пошёл текст ответа — тогда просто ждём
+      const el = currentStatus;
+      if (!el) return;
+      const frames = el.frames || THINK_FRAMES;
+      el.querySelector('.status-emoji').textContent = frames[Math.floor(tick / 2) % frames.length];
+      el.querySelector('.status-dots').textContent = '.'.repeat((tick % 3) + 1);
+      const seconds = Math.floor((Date.now() - started) / 1000);
+      el.querySelector('.status-time').textContent = seconds >= 3 ? seconds + ' с' : '';
+      tick++;
+    };
+    render();
+    statusTimer = setInterval(render, 400);
+  }
+
+  function stopStatus() {
+    if (statusTimer) clearInterval(statusTimer);
+    statusTimer = null;
   }
 
   function setBusy(busy) {
@@ -119,6 +220,15 @@
 
   function addUser(text) {
     addMessage('user').innerHTML = renderMarkdown(text);
+  }
+
+  function addStep(text, before) {
+    const el = document.createElement('div');
+    el.className = 'step';
+    el.textContent = text;
+    if (before) messagesEl.insertBefore(el, before);
+    else messagesEl.appendChild(el);
+    scrollToBottom();
   }
 
   function addError(text) {

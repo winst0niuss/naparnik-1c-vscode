@@ -2,6 +2,12 @@ import * as vscode from 'vscode';
 import { NaparnikClient } from './api/client';
 import { TokenStore } from './tokenStore';
 import { ChatHistory, SavedChat, createChat, makeTitle } from './chatHistory';
+import { AGENT_UNAVAILABLE_TOOL_HINT, MAX_AGENT_STEPS, buildAgentPrompt, describeCommand, parseCommands, stripCommandsForDisplay } from './agent/protocol';
+import { WorkspaceTools } from './agent/workspaceTools';
+import { EditPreview, PendingEdit } from './agent/editPreview';
+
+const PROJECT_ACCESS_KEY = 'naparnik.projectAccess';
+const PROJECT_CONSENT_KEY = 'naparnik.projectAccessConsent';
 
 /** Сообщения из webview в расширение */
 type WebviewMessage =
@@ -11,6 +17,8 @@ type WebviewMessage =
   | { type: 'newChat' }
   | { type: 'showHistory' }
   | { type: 'setToken' }
+  | { type: 'toggleProject' }
+  | { type: 'resolveEdit'; id: number; accepted: boolean }
   | { type: 'insertCode'; code: string };
 
 /** Запрос, который выполняется в фоне — у каждого чата свой */
@@ -30,12 +38,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private running = new Map<string, RunningRequest>();
   // Сообщение, отправленное до того, как панель успела открыться
   private pendingMessage: string | undefined;
+  // Правки, ждущие решения, — чтобы показать карточку снова после перерисовки чата
+  private pendingEdits = new Map<number, PendingEdit>();
 
   constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly tokens: TokenStore,
     private readonly history: ChatHistory,
-  ) {}
+    // workspaceState — переключатель доступа хранится отдельно для каждого проекта
+    private readonly workspaceState: vscode.Memento,
+    private readonly globalState: vscode.Memento,
+    private readonly preview: EditPreview,
+  ) {
+    preview.onDidStart((edit) => {
+      this.pendingEdits.set(edit.id, edit);
+      this.post({ type: 'editPending', ...edit });
+    });
+    preview.onDidEnd(({ id, accepted }) => {
+      this.pendingEdits.delete(id);
+      this.post({ type: 'editResolved', id, accepted });
+    });
+  }
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
@@ -140,16 +163,59 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (run.toolNames) this.post({ type: 'toolCalls', names: run.toolNames });
       if (run.partial) this.post({ type: 'assistantText', text: run.partial });
     }
+    this.pendingEdits.forEach((edit) => this.post({ type: 'editPending', ...edit }));
   }
 
   async refreshTokenState(): Promise<void> {
     this.post({ type: 'tokenState', hasToken: Boolean(await this.tokens.get()) });
   }
 
+  private get projectAccess(): boolean {
+    return this.workspaceState.get<boolean>(PROJECT_ACCESS_KEY, false) && Boolean(vscode.workspace.workspaceFolders?.length);
+  }
+
+  private postProjectState(): void {
+    this.post({
+      type: 'projectAccess',
+      on: this.projectAccess,
+      available: Boolean(vscode.workspace.workspaceFolders?.length),
+    });
+  }
+
+  /** Включить/выключить доступ к файлам проекта. При первом включении — предупреждение о передаче данных */
+  async toggleProjectAccess(): Promise<void> {
+    if (this.projectAccess) {
+      await this.workspaceState.update(PROJECT_ACCESS_KEY, false);
+      this.postProjectState();
+      return;
+    }
+    if (!vscode.workspace.workspaceFolders?.length) {
+      void vscode.window.showWarningMessage('Откройте папку проекта (File → Open Folder), чтобы Напарник мог её читать.');
+      return;
+    }
+    if (!this.globalState.get<boolean>(PROJECT_CONSENT_KEY)) {
+      const answer = await vscode.window.showWarningMessage(
+        'Включить доступ к проекту?',
+        {
+          modal: true,
+          detail:
+            'Напарник сможет смотреть структуру проекта, читать и искать файлы. Прочитанные файлы отправляются в сервис 1С:Напарник (code.1c.ai). ' +
+            'Изменения файлов применяются только после вашего подтверждения.',
+        },
+        'Включить',
+      );
+      if (answer !== 'Включить') return;
+      await this.globalState.update(PROJECT_CONSENT_KEY, true);
+    }
+    await this.workspaceState.update(PROJECT_ACCESS_KEY, true);
+    this.postProjectState();
+  }
+
   private async handleMessage(msg: WebviewMessage): Promise<void> {
     switch (msg.type) {
       case 'ready':
         this.renderCurrentChat();
+        this.postProjectState();
         await this.refreshTokenState();
         if (this.pendingMessage) {
           const text = this.pendingMessage;
@@ -171,6 +237,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'setToken':
         await vscode.commands.executeCommand('naparnik.setToken');
+        break;
+      case 'toggleProject':
+        await this.toggleProjectAccess();
+        break;
+      case 'resolveEdit':
+        this.preview.resolve(msg.id, msg.accepted);
         break;
       case 'insertCode':
         await insertIntoEditor(msg.code);
@@ -212,26 +284,66 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     try {
       const client = new NaparnikClient({ token, ...readSettings() });
       chat.conversationId ??= await client.createConversation(run.abort.signal);
-      const answer = await client.sendMessage(
-        chat.conversationId,
-        text,
-        chat.lastAssistantUuid,
-        {
-          onText: (partial) => {
-            run.partial = partial;
-            postIfVisible({ type: 'assistantText', text: partial });
+
+      const tools = this.projectAccess ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm, run.abort.signal) : undefined;
+      let message = text;
+      if (tools && !chat.agentPrimed) {
+        // Первое сообщение с доступом к проекту: инструкция по командам + дерево проекта
+        message = buildAgentPrompt(await tools.tree(), text);
+        chat.agentPrimed = true;
+      } else if (tools && chat.agentPaused) {
+        message = `(Доступ к проекту снова включён — можно использовать @-команды.)\n\n${text}`;
+      } else if (!tools && chat.agentPrimed && !chat.agentPaused) {
+        message = `(Доступ к проекту сейчас выключен — не используй команды, отвечай сразу.)\n\n${text}`;
+      }
+      // Модель уже знает о выключенном доступе — повторять не нужно, но при включении сообщить
+      chat.agentPaused = chat.agentPrimed && !tools;
+
+      // Агентный цикл: ответ с командами → выполняем → отправляем результат → снова ответ
+      for (let step = 0; ; step++) {
+        const answer = await client.sendMessage(
+          chat.conversationId,
+          message,
+          chat.lastAssistantUuid,
+          {
+            onText: (partial) => {
+              run.partial = chat.agentPrimed ? stripCommandsForDisplay(partial) : partial;
+              postIfVisible({ type: 'assistantText', text: run.partial });
+            },
+            onToolCalls: (names) => {
+              run.toolNames = names;
+              postIfVisible({ type: 'toolCalls', names });
+            },
+            unavailableToolHint: tools ? AGENT_UNAVAILABLE_TOOL_HINT : undefined,
           },
-          onToolCalls: (names) => {
-            run.toolNames = names;
-            postIfVisible({ type: 'toolCalls', names });
-          },
-        },
-        run.abort.signal,
-      );
-      chat.lastAssistantUuid = answer.assistantUuid;
-      chat.entries.push({ role: 'assistant', text: answer.text });
-      postIfVisible({ type: 'assistantDone', text: answer.text });
-      this.notifyIfHidden(chat);
+          run.abort.signal,
+        );
+        chat.lastAssistantUuid = answer.assistantUuid;
+
+        const commands = tools ? parseCommands(answer.text) : [];
+        if (commands.length === 0) {
+          chat.entries.push({ role: 'assistant', text: answer.text });
+          postIfVisible({ type: 'assistantDone', text: answer.text });
+          this.notifyIfHidden(chat);
+          break;
+        }
+        if (step >= MAX_AGENT_STEPS) {
+          throw new Error(`Напарник не уложился в ${MAX_AGENT_STEPS} шагов. Попробуйте уточнить вопрос.`);
+        }
+
+        const results: string[] = [];
+        for (const cmd of commands) {
+          const description = describeCommand(cmd);
+          chat.entries.push({ role: 'step', text: description });
+          postIfVisible({ type: 'step', text: description });
+          results.push(`### ${description}\n${await tools!.run(cmd)}`);
+          // Пока пользователь смотрел diff, запрос могли остановить
+          if (run.abort.signal.aborted) throw new Error('Остановлено');
+        }
+        run.partial = '';
+        postIfVisible({ type: 'assistantText', text: '' });
+        message = `Результаты команд:\n\n${results.join('\n\n')}`;
+      }
     } catch (err) {
       const message = run.abort.signal.aborted ? 'Остановлено' : errorMessage(err);
       chat.entries.push({ role: 'error', text: message });
@@ -239,6 +351,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // После сбоя начинаем новую дискуссию: старая могла остаться в неконсистентном состоянии
       chat.conversationId = undefined;
       chat.lastAssistantUuid = undefined;
+      chat.agentPrimed = false;
+      chat.agentPaused = false;
     } finally {
       this.running.delete(chat.id);
       // Удалённый во время ответа чат обратно в историю не возвращаем
@@ -287,6 +401,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </div>
   <div id="messages"></div>
   <form id="composer">
+    <div class="composer-tools">
+      <button type="button" id="project-toggle" class="toggle" title="Разрешить Напарнику смотреть и читать файлы открытого проекта">
+        <span class="toggle-dot"></span>Доступ к проекту
+      </button>
+    </div>
     <textarea id="input" rows="3" placeholder="Задай мне вопрос…&#10;Enter — отправить, Shift+Enter — новая строка"></textarea>
     <div class="actions">
       <button type="button" id="stop" class="secondary hidden">Стоп</button>

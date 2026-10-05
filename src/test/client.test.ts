@@ -132,3 +132,44 @@ test('параллельные запросы в разные дискуссии
     server.close();
   }
 });
+
+test('инструменты 1С:EDT отклоняются с пояснением, поиск по ИТС подтверждается', async () => {
+  let calls = 0;
+  const mock = await startMock(() => {
+    calls++;
+    if (calls === 1) {
+      return {
+        sse: [
+          {
+            role: 'assistant',
+            uuid: 'asst-1',
+            content: {
+              tool_calls: [
+                { id: 'c-its', function: { name: 'mcp__knowledge-hub__Search_ITS' } },
+                { id: 'c-edt', function: { name: 'WriteSystemFile' } },
+              ],
+            },
+            finished: true,
+          },
+        ],
+      };
+    }
+    return { sse: [{ role: 'assistant', uuid: 'asst-2', content: { content: 'готово' }, finished: true }] };
+  });
+  try {
+    const tools: string[][] = [];
+    const answer = await mock.client.sendMessage('conv', 'вопрос', undefined, {
+      onText: () => {},
+      onToolCalls: (n) => tools.push(n),
+      unavailableToolHint: 'используй @create_file',
+    });
+    assert.equal(answer.text, 'готово');
+    assert.deepEqual(tools, [['mcp__knowledge-hub__Search_ITS']]);
+    assert.deepEqual(mock.requests[1].body.content, [
+      { tool_call_id: 'c-its', status: 'accepted', content: null },
+      { tool_call_id: 'c-edt', status: 'rejected', content: 'используй @create_file' },
+    ]);
+  } finally {
+    mock.close();
+  }
+});

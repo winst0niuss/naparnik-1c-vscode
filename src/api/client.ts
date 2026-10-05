@@ -17,7 +17,19 @@ export interface StreamCallbacks {
   onText: (text: string) => void;
   /** Модель вызвала серверные инструменты (поиск по ИТС, документации) */
   onToolCalls?: (toolNames: string[]) => void;
+  /** Пояснение для модели, когда она вызывает недоступный инструмент (например, инструменты 1С:EDT) */
+  unavailableToolHint?: string;
 }
+
+// Инструменты сервиса, которые работают без 1С:EDT. Остальные (WriteSystemFile, GetObject_in_Project…)
+// требуют сессии EDT и без неё падают — такие вызовы отклоняем
+const USABLE_SERVER_TOOLS = ['mcp__knowledge-hub__', 'mcp__syntax-checker__', 'mcp__web__'];
+
+export function isUsableServerTool(name: string | undefined): boolean {
+  return Boolean(name && USABLE_SERVER_TOOLS.some((prefix) => name.startsWith(prefix)));
+}
+
+const DEFAULT_UNAVAILABLE_HINT = 'Инструмент недоступен: работа идёт не из 1С:EDT, сессии проекта нет. Ответь без него.';
 
 export interface ChatAnswer {
   text: string;
@@ -122,8 +134,11 @@ export class NaparnikClient {
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
       const result = await this.streamRequest(conversationId, payload, callbacks, signal);
+      // Вызовы без id сервер создаёт, когда принимает текст модели за вызов инструмента
+      // (например, XML-теги в ответе). Подтвердить их нельзя — считаем ответ обычным текстом.
+      const accepted = result.toolCalls.filter((tc) => tc.id);
 
-      if (!result.hasToolCalls) {
+      if (!result.hasToolCalls || accepted.length === 0) {
         if (result.hasOnlyReasoning) {
           throw new Error('API вернул только рассуждения без итогового ответа');
         }
@@ -141,16 +156,20 @@ export class NaparnikClient {
       if (!result.assistantUuid) {
         throw new Error('API вернул tool_calls без идентификатора сообщения');
       }
-      const accepted = result.toolCalls.filter((tc) => tc.id);
-      if (accepted.length === 0) {
-        throw new Error('API вернул tool_calls без идентификаторов вызовов');
+      const usable = accepted.filter((tc) => isUsableServerTool(tc.function?.name));
+      if (usable.length > 0) {
+        callbacks.onToolCalls?.(usable.map(toolName));
       }
-      callbacks.onToolCalls?.(accepted.map(toolName));
 
       payload = {
         parent_uuid: result.assistantUuid,
         role: 'tool',
-        content: accepted.map((tc) => ({ tool_call_id: tc.id, status: 'accepted', content: null })),
+        // accepted — сервер выполнит сам (content обязан быть пустым), rejected — с пояснением для модели
+        content: accepted.map((tc) =>
+          isUsableServerTool(tc.function?.name)
+            ? { tool_call_id: tc.id, status: 'accepted', content: null }
+            : { tool_call_id: tc.id, status: 'rejected', content: callbacks.unavailableToolHint ?? DEFAULT_UNAVAILABLE_HINT },
+        ),
       };
     }
     throw new Error('Превышен лимит шагов поиска 1С:Напарник');

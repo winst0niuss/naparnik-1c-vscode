@@ -3,12 +3,22 @@ import { ChatViewProvider } from './chatViewProvider';
 import { TokenStore } from './tokenStore';
 import { findTokenProblem } from './api/client';
 import { ChatHistory } from './chatHistory';
+import { EditPreview } from './agent/editPreview';
 
 export function activate(context: vscode.ExtensionContext): void {
   const tokens = new TokenStore(context.secrets);
-  const chat = new ChatViewProvider(context.extensionUri, tokens, new ChatHistory(context.globalState));
+  const preview = new EditPreview();
+  const chat = new ChatViewProvider(
+    context.extensionUri,
+    tokens,
+    new ChatHistory(context.globalState),
+    context.workspaceState,
+    context.globalState,
+    preview,
+  );
 
   context.subscriptions.push(
+    preview.register(),
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewId, chat, {
       // Не терять переписку и идущий стрим при переключении панелей
       webviewOptions: { retainContextWhenHidden: true },
@@ -16,6 +26,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
     vscode.commands.registerCommand('naparnik.newChat', () => chat.newChat()),
     vscode.commands.registerCommand('naparnik.showHistory', () => chat.showHistory()),
+    vscode.commands.registerCommand('naparnik.toggleProjectAccess', () => chat.toggleProjectAccess()),
+    // Кнопки ✓/✕ в заголовке вкладки с diff предложенной правки
+    vscode.commands.registerCommand('naparnik.applyEdit', (uri?: vscode.Uri) => preview.resolveByUri(uri ?? activeDiffUri(), true)),
+    vscode.commands.registerCommand('naparnik.rejectEdit', (uri?: vscode.Uri) => preview.resolveByUri(uri ?? activeDiffUri(), false)),
 
     vscode.commands.registerCommand('naparnik.setToken', async () => {
       const token = await vscode.window.showInputBox({
@@ -55,6 +69,12 @@ export function activate(context: vscode.ExtensionContext): void {
 
     tokens.onDidChange(() => chat.refreshTokenState()),
   );
+}
+
+/** Правая сторона активного diff — на случай вызова команды из палитры */
+function activeDiffUri(): vscode.Uri | undefined {
+  const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+  return input instanceof vscode.TabInputTextDiff ? input.modified : undefined;
 }
 
 export function deactivate(): void {}

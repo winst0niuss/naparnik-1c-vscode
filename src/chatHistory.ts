@@ -2,7 +2,8 @@
 import type * as vscode from 'vscode';
 
 export interface ChatEntry {
-  role: 'user' | 'assistant' | 'error';
+  // step — шаг работы с проектом («Читаю …»)
+  role: 'user' | 'assistant' | 'error' | 'step';
   text: string;
 }
 
@@ -14,6 +15,10 @@ export interface SavedChat {
   /** Дискуссия на сервере — чтобы продолжить старый чат с сохранённым контекстом */
   conversationId?: string;
   lastAssistantUuid?: string;
+  /** Модели уже отправлена инструкция по командам работы с проектом */
+  agentPrimed?: boolean;
+  /** Доступ к проекту выключили после инструкции — модели уже сказано не использовать команды */
+  agentPaused?: boolean;
 }
 
 const STORAGE_KEY = 'naparnik.chats';

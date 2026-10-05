@@ -2,7 +2,7 @@
   "name": "naparnik-1c-chat",
   "displayName": "Напарник",
   "description": "Неофициальный чат с 1С:Напарник.",
-  "version": "0.3.3",
+  "version": "0.4.5",
   "publisher": "winst0niuss",
   "license": "MIT",
   "icon": "media/marketplace-icon.png",
@@ -24,7 +24,7 @@
       "activitybar": [
         {
           "id": "naparnik",
-          "title": "Напарник. Неофициальный чат-бот 1С",
+          "title": "Напарник",
           "icon": "media/icon.svg"
         }
       ]
@@ -34,7 +34,7 @@
         {
           "type": "webview",
           "id": "naparnik.chat",
-          "name": "Напарник. Неофициальный чат-бот 1С"
+          "name": "Напарник"
         }
       ]
     },
@@ -52,6 +52,12 @@
         "icon": "$(history)"
       },
       {
+        "command": "naparnik.toggleProjectAccess",
+        "title": "Доступ к проекту (вкл/выкл)",
+        "category": "1С:Напарник",
+        "icon": "$(folder)"
+      },
+      {
         "command": "naparnik.setToken",
         "title": "Задать токен",
         "category": "1С:Напарник",
@@ -66,6 +72,18 @@
         "command": "naparnik.askAboutSelection",
         "title": "Спросить Напарника о выделенном коде",
         "category": "1С:Напарник"
+      },
+      {
+        "command": "naparnik.applyEdit",
+        "title": "Применить правку Напарника",
+        "category": "1С:Напарник",
+        "icon": "$(check)"
+      },
+      {
+        "command": "naparnik.rejectEdit",
+        "title": "Отклонить правку Напарника",
+        "category": "1С:Напарник",
+        "icon": "$(close)"
       }
     ],
     "menus": {
@@ -91,6 +109,28 @@
           "command": "naparnik.askAboutSelection",
           "when": "editorHasSelection",
           "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "naparnik.applyEdit",
+          "when": "resourceScheme == naparnik-proposed",
+          "group": "navigation@1"
+        },
+        {
+          "command": "naparnik.rejectEdit",
+          "when": "resourceScheme == naparnik-proposed",
+          "group": "navigation@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "naparnik.applyEdit",
+          "when": "resourceScheme == naparnik-proposed"
+        },
+        {
+          "command": "naparnik.rejectEdit",
+          "when": "resourceScheme == naparnik-proposed"
         }
       ]
     },

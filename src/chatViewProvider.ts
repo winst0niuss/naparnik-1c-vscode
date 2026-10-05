@@ -2,7 +2,18 @@ import * as vscode from 'vscode';
 import { NaparnikClient } from './api/client';
 import { TokenStore } from './tokenStore';
 import { ChatHistory, SavedChat, createChat, makeTitle } from './chatHistory';
-import { AGENT_UNAVAILABLE_TOOL_HINT, MAX_AGENT_STEPS, buildAgentPrompt, describeCommand, parseCommands, stripCommandsForDisplay } from './agent/protocol';
+import {
+  AGENT_UNAVAILABLE_TOOL_HINT,
+  MAX_AGENT_STEPS,
+  buildAgentPrompt,
+  describeCommand,
+  findUnfinishedWrite,
+  looksLikeMalformedEdit,
+  MALFORMED_EDIT_HINT,
+  parseCommands,
+  stripCommandsForDisplay,
+} from './agent/protocol';
+import { INIT_PROMPT, MAKE_RULES_PROMPT, RULES_DIR, SLASH_COMMANDS, helpText, parseSlash } from './slashCommands';
 import { WorkspaceTools } from './agent/workspaceTools';
 import { EditPreview, PendingEdit } from './agent/editPreview';
 
@@ -28,6 +39,8 @@ interface RunningRequest {
   // Состояние стрима, чтобы показать его при возврате в чат
   partial: string;
   toolNames?: string[];
+  /** Модели уже напомнили формат правки — второй раз не напоминаем, чтобы не зациклиться */
+  formatReminded?: boolean;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -211,9 +224,134 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postProjectState();
   }
 
+  /** Сообщение из чата: слэш-команда выполняется в расширении, остальное уходит Напарнику */
+  private async handleInput(text: string): Promise<void> {
+    const slash = parseSlash(text);
+    if (!slash) {
+      await this.send(text);
+      return;
+    }
+    switch (slash.name) {
+      case 'clear':
+        this.newChat();
+        break;
+      case 'history':
+        await this.showHistory();
+        break;
+      case 'project':
+        await this.toggleProjectAccess();
+        break;
+      case 'stop': {
+        const run = this.running.get(this.chat.id);
+        if (run) run.abort.abort();
+        else this.info('Сейчас нечего останавливать.');
+        break;
+      }
+      case 'token':
+        await vscode.commands.executeCommand('naparnik.setToken');
+        break;
+      case 'help':
+        this.info(helpText());
+        break;
+      case 'exit':
+        this.running.get(this.chat.id)?.abort.abort();
+        await this.closeView();
+        break;
+      case 'init':
+        if (await this.ensureProjectAccess('/init')) {
+          await this.send('/init', INIT_PROMPT);
+        }
+        break;
+      case 'make-rules':
+        if (this.chat.entries.length === 0) {
+          this.info('В этом чате пока нечего записывать: `/make-rules` собирает правила из уже состоявшегося разговора.');
+        } else if (await this.ensureProjectAccess('/make-rules')) {
+          await this.send('/make-rules', MAKE_RULES_PROMPT);
+        }
+        break;
+      case 'rules':
+        await this.showRules();
+        break;
+      default:
+        this.info(`Нет команды \`/${slash.name}\`. Список команд — \`/help\`.`);
+    }
+  }
+
+  /** Подсказка в чате от расширения (не от модели и не в историю) */
+  private info(markdown: string): void {
+    this.post({ type: 'info', text: markdown });
+  }
+
+  /** /init и /make-rules работают с файлами — без доступа к проекту предлагаем его включить */
+  private async ensureProjectAccess(command: string): Promise<boolean> {
+    if (!this.projectAccess) {
+      await this.toggleProjectAccess();
+    }
+    if (!this.projectAccess) {
+      this.info(`Для \`${command}\` нужен доступ к проекту: откройте папку и включите «Доступ к проекту».`);
+      return false;
+    }
+    return true;
+  }
+
+  private async closeView(): Promise<void> {
+    // Панель может быть в боковой панели или внизу — пробуем скрыть сам view, затем запасные варианты
+    for (const command of [`${ChatViewProvider.viewId}.removeView`, 'workbench.action.closePanel']) {
+      try {
+        await vscode.commands.executeCommand(command);
+        return;
+      } catch {
+        // команда недоступна в этой версии VS Code — пробуем следующую
+      }
+    }
+  }
+
+  /** /rules: список правил из .rules, открыть или создать новое */
+  private async showRules(): Promise<void> {
+    const tools = WorkspaceTools.forCurrentWorkspace(this.preview.confirm);
+    if (!tools) {
+      void vscode.window.showWarningMessage('Откройте папку проекта, чтобы работать с правилами.');
+      return;
+    }
+    type Item = vscode.QuickPickItem & { uri?: vscode.Uri; action?: 'new' | 'make' };
+    const files = await tools.ruleFiles();
+    const items: Item[] = [
+      ...files.map((uri) => ({ label: `$(file) ${vscode.workspace.asRelativePath(uri)}`, uri })),
+      ...(files.length > 0 ? [{ label: '', kind: vscode.QuickPickItemKind.Separator } as Item] : []),
+      { label: '$(add) Новое правило…', description: `файл в ${RULES_DIR}/`, action: 'new' },
+      { label: '$(sparkle) Записать правила из этого чата', description: '/make-rules', action: 'make' },
+    ];
+    const pick = await vscode.window.showQuickPick(items, {
+      title: files.length > 0 ? 'Правила проекта' : `Правил пока нет — папка ${RULES_DIR}/ появится с первым правилом`,
+      placeHolder: 'Выберите файл или действие',
+    });
+    if (pick?.uri) {
+      await vscode.window.showTextDocument(pick.uri);
+    } else if (pick?.action === 'make') {
+      await this.handleInput('/make-rules');
+    } else if (pick?.action === 'new') {
+      const name = await vscode.window.showInputBox({
+        title: 'Новое правило',
+        prompt: 'Тема правила — станет именем файла',
+        placeHolder: 'code-style',
+        validateInput: (v) => (/^[\w\-а-яё ]+$/i.test(v.trim()) ? undefined : 'Только буквы, цифры, «-» и пробелы'),
+      });
+      if (!name?.trim()) return;
+      const fileName = name.trim().replace(/\s+/g, '-');
+      const uri = vscode.Uri.joinPath(tools.rootUri, RULES_DIR, `${fileName}.md`);
+      try {
+        await vscode.workspace.fs.stat(uri);
+      } catch {
+        await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(`# ${name.trim()}\n\n- \n`));
+      }
+      await vscode.window.showTextDocument(uri);
+    }
+  }
+
   private async handleMessage(msg: WebviewMessage): Promise<void> {
     switch (msg.type) {
       case 'ready':
+        this.post({ type: 'commands', list: SLASH_COMMANDS });
         this.renderCurrentChat();
         this.postProjectState();
         await this.refreshTokenState();
@@ -224,7 +362,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         break;
       case 'send':
-        await this.send(msg.text);
+        await this.handleInput(msg.text);
         break;
       case 'stop':
         this.running.get(this.chat.id)?.abort.abort();
@@ -250,10 +388,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async send(text: string): Promise<void> {
+  /**
+   * Отправить вопрос. text — то, что видит пользователь в чате и истории;
+   * modelText — что уходит модели (для /init и /make-rules это развёрнутая инструкция).
+   */
+  private async send(text: string, modelText?: string): Promise<void> {
     text = text.trim();
     // В одном чате — один запрос за раз; в других чатах можно спрашивать параллельно
-    if (!text || this.running.has(this.chat.id)) {
+    if (!text) {
+      return;
+    }
+    if (this.running.has(this.chat.id)) {
+      this.info('Напарник ещё отвечает в этом чате. Дождитесь ответа или остановите его — `/stop`.');
       return;
     }
 
@@ -286,15 +432,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       chat.conversationId ??= await client.createConversation(run.abort.signal);
 
       const tools = this.projectAccess ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm, run.abort.signal) : undefined;
-      let message = text;
+      const question = modelText ?? text;
+      let message = question;
       if (tools && !chat.agentPrimed) {
-        // Первое сообщение с доступом к проекту: инструкция по командам + дерево проекта
-        message = buildAgentPrompt(await tools.tree(), text);
+        // Первое сообщение с доступом к проекту: инструкция по командам, дерево, документация и правила
+        message = buildAgentPrompt(await tools.tree(), question, await tools.projectContext());
         chat.agentPrimed = true;
       } else if (tools && chat.agentPaused) {
-        message = `(Доступ к проекту снова включён — можно использовать @-команды.)\n\n${text}`;
+        message = `(Доступ к проекту снова включён — можно использовать @-команды.)\n\n${question}`;
       } else if (!tools && chat.agentPrimed && !chat.agentPaused) {
-        message = `(Доступ к проекту сейчас выключен — не используй команды, отвечай сразу.)\n\n${text}`;
+        message = `(Доступ к проекту сейчас выключен — не используй команды, отвечай сразу.)\n\n${question}`;
       }
       // Модель уже знает о выключенном доступе — повторять не нужно, но при включении сообщить
       chat.agentPaused = chat.agentPrimed && !tools;
@@ -308,7 +455,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           {
             onText: (partial) => {
               run.partial = chat.agentPrimed ? stripCommandsForDisplay(partial) : partial;
-              postIfVisible({ type: 'assistantText', text: run.partial });
+              // Модель пишет содержимое файла — вместе с текстом передаём прогресс, чтобы показать его вместо «думает»
+              const writing = chat.agentPrimed ? findUnfinishedWrite(partial) : undefined;
+              postIfVisible({ type: 'assistantText', text: run.partial, writing });
             },
             onToolCalls: (names) => {
               run.toolNames = names;
@@ -321,6 +470,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         chat.lastAssistantUuid = answer.assistantUuid;
 
         const commands = tools ? parseCommands(answer.text) : [];
+        // Правка без @edit_file — один раз напоминаем формат, а не показываем блок как ответ
+        if (tools && commands.length === 0 && looksLikeMalformedEdit(answer.text) && !run.formatReminded && step < MAX_AGENT_STEPS) {
+          run.formatReminded = true;
+          run.partial = '';
+          postIfVisible({ type: 'assistantText', text: '' });
+          message = MALFORMED_EDIT_HINT;
+          continue;
+        }
         if (commands.length === 0) {
           chat.entries.push({ role: 'assistant', text: answer.text });
           postIfVisible({ type: 'assistantDone', text: answer.text });
@@ -406,6 +563,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <span class="toggle-dot"></span>Доступ к проекту
       </button>
     </div>
+    <div id="slash-menu" class="slash-menu hidden" role="listbox"></div>
     <textarea id="input" rows="3" placeholder="Задай мне вопрос…&#10;Enter — отправить, Shift+Enter — новая строка"></textarea>
     <div class="actions">
       <button type="button" id="stop" class="secondary hidden">Стоп</button>
@@ -428,7 +586,7 @@ function readSettings() {
     baseUrl: cfg.get<string>('baseUrl', 'https://code.1c.ai'),
     authFormat: cfg.get<'plain' | 'bearer'>('authFormat', 'plain'),
     skillName: cfg.get<string>('skillName', 'custom'),
-    timeoutMs: cfg.get<number>('timeoutSeconds', 120) * 1000,
+    timeoutMs: cfg.get<number>('timeoutSeconds', 300) * 1000,
   };
 }
 

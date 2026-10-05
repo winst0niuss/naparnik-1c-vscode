@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { applySearchReplace, parseCommands, stripCommandsForDisplay } from '../agent/protocol';
+import { applySearchReplace, buildAgentPrompt, findUnfinishedWrite, looksLikeMalformedEdit, parseCommands, stripCommandsForDisplay } from '../agent/protocol';
 
 test('команды чтения разбираются в порядке появления', () => {
   const cmds = parseCommands(
@@ -115,4 +115,57 @@ test('строчный синтаксис @-команд', () => {
   assert.equal(stripCommandsForDisplay('@list_dir src\n@rea'), '');
   // Обычный текст с «@» в середине строки — не команда
   assert.deepEqual(parseCommands('Напишите на почту a@b.ru'), []);
+});
+
+test('findUnfinishedWrite: прогресс записи файла во время стрима', () => {
+  assert.deepEqual(findUnfinishedWrite('@create_file docs/A.md\n# Заголовок\nтекст'), { path: 'docs/A.md', chars: 17, isNew: true });
+  assert.equal(findUnfinishedWrite('@create_file docs/A.md\n# Заголовок\n@end\nГотово'), undefined);
+  assert.equal(findUnfinishedWrite('@read_file a.bsl'), undefined);
+  assert.equal(findUnfinishedWrite('@edit_file `src/a.bsl`\n<<<<<<< SEARCH')?.path, 'src/a.bsl');
+});
+
+test('контекст проекта попадает в первое сообщение: правила раньше документации', () => {
+  const prompt = buildAgentPrompt({ text: 'src/', complete: true }, 'Вопрос', {
+    docs: ['README.md', 'CLAUDE.md', 'docs/big.md'],
+    attached: [{ path: 'README.md', text: '# Проект' }],
+    rules: [{ path: '.rules/git.md', text: '- коммиты на русском' }],
+  });
+  assert.ok(prompt.indexOf('.rules/git.md') < prompt.indexOf('--- README.md ---'));
+  assert.ok(prompt.includes('Ещё есть (читай через @read_file, когда нужно): CLAUDE.md, docs/big.md'));
+  assert.ok(prompt.trimEnd().endsWith('Вопрос пользователя: Вопрос'));
+});
+
+test('блок без @end закрывается следующей @-командой (так пишет реальная модель)', () => {
+  const text = [
+    '@create_file .rules/a.md',
+    '# А',
+    '- правило',
+    '@create_file .rules/b.md',
+    '# Б',
+    '@edit_file .rules/c.md',
+    '<<<<<<< SEARCH',
+    'x',
+    '=======',
+    'y',
+    '>>>>>>> REPLACE',
+  ].join('\n');
+  assert.deepEqual(parseCommands(text), [
+    { kind: 'create_file', path: '.rules/a.md', content: '# А\n- правило' },
+    { kind: 'create_file', path: '.rules/b.md', content: '# Б' },
+    { kind: 'edit_file', path: '.rules/c.md', edits: [{ search: 'x', replace: 'y' }] },
+  ]);
+});
+
+test('create_file с SEARCH/REPLACE внутри и правка без @edit_file', () => {
+  const text = '@create_file .rules/a.md\n<<<<<<< SEARCH\n\n=======\n# Стиль\n- правило\n>>>>>>> REPLACE\n@end';
+  assert.deepEqual(parseCommands(text), [{ kind: 'create_file', path: '.rules/a.md', content: '# Стиль\n- правило' }]);
+  assert.equal(looksLikeMalformedEdit('Вот правка:\n<<<<<<< SEARCH\nа\n=======\nб\n>>>>>>> REPLACE'), true);
+  assert.equal(looksLikeMalformedEdit('@edit_file a.md\n<<<<<<< SEARCH\nа\n=======\nб\n>>>>>>> REPLACE\n@end'), false);
+});
+
+test('строка «@read_file …» внутри текста файла не обрывает блок, если есть @end', () => {
+  const text = '@create_file NAPARNIK.md\n# Команды\n@read_file путь — прочитать файл\n@search текст\nКонец\n@end\nГотово.';
+  assert.deepEqual(parseCommands(text), [
+    { kind: 'create_file', path: 'NAPARNIK.md', content: '# Команды\n@read_file путь — прочитать файл\n@search текст\nКонец' },
+  ]);
 });

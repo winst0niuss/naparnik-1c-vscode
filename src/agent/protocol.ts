@@ -18,12 +18,49 @@ export interface SearchReplace {
 
 export const MAX_AGENT_STEPS = 12;
 
+/** Что уже известно о проекте: документация, инструкции ИИ-инструментов и правила пользователя */
+export interface ProjectContext {
+  /** Все найденные файлы документации и инструкций (пути) */
+  docs: string[];
+  /** Короткие файлы документации — прикладываются целиком */
+  attached: { path: string; text: string }[];
+  /** Правила пользователя из .rules/ — приоритетнее всего остального */
+  rules: { path: string; text: string }[];
+}
+
+export const EMPTY_CONTEXT: ProjectContext = { docs: [], attached: [], rules: [] };
+
+function renderContext(ctx: ProjectContext): string {
+  const parts: string[] = [];
+  if (ctx.rules.length > 0) {
+    parts.push(
+      'Правила проекта от пользователя (папка .rules) — выполняй их в первую очередь, они важнее остальных инструкций:\n' +
+        ctx.rules.map((r) => `--- ${r.path} ---\n${r.text.trim()}`).join('\n\n'),
+    );
+  }
+  if (ctx.docs.length > 0) {
+    const attachedPaths = new Set(ctx.attached.map((a) => a.path));
+    const rest = ctx.docs.filter((d) => !attachedPaths.has(d));
+    parts.push(
+      'Документация и инструкции в проекте. Сначала опирайся на них и только потом исследуй код. ' +
+        'Если инструкции из разных файлов противоречат друг другу — скажи об этом, не выбирай молча.' +
+        (ctx.attached.length > 0 ? '\n\n' + ctx.attached.map((a) => `--- ${a.path} ---\n${a.text.trim()}`).join('\n\n') : '') +
+        (rest.length > 0 ? `\n\nЕщё есть (читай через @read_file, когда нужно): ${rest.join(', ')}` : ''),
+    );
+  }
+  return parts.length > 0 ? parts.join('\n\n') + '\n\n' : '';
+}
+
 /** Ответ модели, когда она вызывает инструмент 1С:EDT вместо @-команды */
 export const AGENT_UNAVAILABLE_TOOL_HINT =
   'Этот инструмент недоступен: работа идёт не из 1С:EDT. Для файлов проекта используй команды @list_dir, @read_file, @search, @edit_file, @create_file — ответь ими.';
 
 /** Инструкция для модели. Отправляется первым сообщением чата с включённым доступом к проекту */
-export function buildAgentPrompt(projectTree: { text: string; complete: boolean }, question: string): string {
+export function buildAgentPrompt(
+  projectTree: { text: string; complete: boolean },
+  question: string,
+  context: ProjectContext = EMPTY_CONTEXT,
+): string {
   const treeTitle = projectTree.complete
     ? 'Структура проекта (полная — все папки и файлы уже перечислены, @list_dir для них не нужен):'
     : 'Структура проекта (только верхние уровни — остальное смотри через @list_dir или @search):';
@@ -55,12 +92,15 @@ export function buildAgentPrompt(projectTree: { text: string; complete: boolean 
 - Пути — относительно корня проекта, через "/". НЕ угадывай пути: сначала @list_dir или @search.
 - В выгрузке конфигурации 1С модули лежат так: <Тип>/<Имя>/Ext/ObjectModule.bsl, ManagerModule.bsl, Module.bsl (общие модули), Forms/<Форма>/Ext/Form/Module.bsl.
 - Перед правкой прочитай файл: SEARCH должен в точности совпадать с текстом файла и быть уникальным. В одном @edit_file может быть несколько блоков.
+- Каждый @edit_file и @create_file закрывай строкой @end.
+- Если пользователь просит запомнить правило («запомни…», «всегда делай…», «добавь правило…») — записывай его в папку .rules/: один файл на тему (.rules/naming.md, .rules/code-style.md…), сначала проверь, есть ли подходящий файл.
+- В итоговом ответе перечисляй только то, что действительно сделано по результатам команд.
 - Я выполню команды и пришлю результат. Когда информации достаточно — дай обычный ответ без команд.
 
 ${treeTitle}
 ${projectTree.text}
 
-Вопрос пользователя: ${question}`;
+${renderContext(context)}Вопрос пользователя: ${question}`;
 }
 
 const LINE_COMMAND = /^\s*@(list_dir|read_file|search|edit_file|create_file)\b[ \t]*(.*)$/;
@@ -89,9 +129,15 @@ function parseLineCommands(text: string): AgentCommand[] {
       const [query, glob] = rawArg.split(/\s+\|\s+/).map(unquote);
       if (query) commands.push({ kind: 'search', query, glob: glob || undefined });
     } else {
-      // Тело блока — до @end (или до конца ответа, если модель забыла @end)
+      // Тело блока — до @end. Модель иногда забывает @end: тогда блок закрывает следующая @-команда или конец ответа
       const body: string[] = [];
-      while (++i < lines.length && !/^\s*@end\s*$/.test(lines[i])) body.push(lines[i]);
+      while (++i < lines.length && !/^\s*@end\s*$/.test(lines[i])) {
+        if (startsNextCommand(lines, i)) {
+          i--; // эту строку разберёт внешний цикл
+          break;
+        }
+        body.push(lines[i]);
+      }
       if (!arg) continue;
       if (kind === 'edit_file') {
         const edits = parseSearchReplace(body.join('\n'));
@@ -102,6 +148,23 @@ function parseLineCommands(text: string): AgentCommand[] {
     }
   }
   return commands;
+}
+
+/**
+ * Строка внутри блока @create_file/@edit_file — начало следующей команды (модель забыла @end)
+ * или часть текста файла (например, документация с примером «@read_file …»)?
+ * Новый блок правки — всегда команда. Команда чтения — команда, только если дальше нет @end,
+ * который закрыл бы текущий блок.
+ */
+function startsNextCommand(lines: string[], i: number): boolean {
+  const m = lines[i].match(LINE_COMMAND);
+  if (!m) return false;
+  if (m[1] === 'edit_file' || m[1] === 'create_file') return true;
+  for (let j = i + 1; j < lines.length; j++) {
+    if (/^\s*@end\s*$/.test(lines[j])) return false;
+    if (/^\s*@(edit_file|create_file)\b/.test(lines[j])) return true;
+  }
+  return true;
 }
 
 /** Запасной синтаксис: <read_file path="a"/> или <read_file><path>a</path></read_file> */
@@ -167,6 +230,22 @@ export function stripCommandsForDisplay(text: string): string {
     .trim();
 }
 
+/**
+ * Модель сейчас пишет содержимое файла: в конце стрима есть @create_file/@edit_file без @end.
+ * Нужно, чтобы показать «Пишет файл… N символов» вместо «думает».
+ */
+export function findUnfinishedWrite(text: string): { path: string; chars: number; isNew: boolean } | undefined {
+  const lines = text.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/^\s*@end\s*$/.test(lines[i])) return undefined;
+    const m = lines[i].match(/^\s*@(create_file|edit_file)[ \t]+(.+)$/);
+    if (m) {
+      return { path: unquote(m[2]), chars: lines.slice(i + 1).join('\n').length, isNew: m[1] === 'create_file' };
+    }
+  }
+  return undefined;
+}
+
 /** Применить блоки SEARCH/REPLACE к тексту. Ошибка — с понятным для модели описанием */
 export function applySearchReplace(original: string, edits: SearchReplace[]): string {
   // Файлы 1С часто в CRLF: сравниваем в LF, затем возвращаем исходные переводы строк
@@ -213,11 +292,27 @@ function unquote(value: string | undefined): string {
   return (value ?? '').trim().replace(/^[`"']+|[`"']+$/g, '');
 }
 
-/** Модель иногда оборачивает содержимое нового файла в ``` */
+/**
+ * Модель иногда оборачивает содержимое нового файла в ``` или в блок SEARCH/REPLACE с пустым SEARCH —
+ * в файл должен попасть только сам текст
+ */
 function stripFence(body: string): string {
-  const m = body.match(/^\s*```[\w-]*\n([\s\S]*?)\n```\s*$/);
-  return m ? m[1] : body;
+  const fence = body.match(/^\s*```[\w-]*\n([\s\S]*?)\n```\s*$/);
+  if (fence) return fence[1];
+  const edits = parseSearchReplace(body);
+  if (edits.length === 1 && !edits[0].search.trim() && /^\s*<{5,9} SEARCH/.test(body) && />{5,9} REPLACE\s*$/.test(body)) {
+    return edits[0].replace;
+  }
+  return body;
 }
+
+/** Ответ похож на правку, но без команды @edit_file — модель забыла формат */
+export function looksLikeMalformedEdit(text: string): boolean {
+  return /<{5,9} SEARCH/.test(text) && />{5,9} REPLACE/.test(text) && parseCommands(text).length === 0;
+}
+
+export const MALFORMED_EDIT_HINT =
+  'Правка не выполнена: блоки SEARCH/REPLACE должны быть внутри команды — строка «@edit_file путь», затем блоки, затем «@end». Повтори правку в этом формате.';
 
 /** <path>a</path><query>b</query> → { path: 'a', query: 'b' } */
 function parseChildElements(body: string): Record<string, string> {

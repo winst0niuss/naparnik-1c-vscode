@@ -173,3 +173,29 @@ test('инструменты 1С:EDT отклоняются с пояснени�
     mock.close();
   }
 });
+
+test('таймаут считается по паузе в данных: медленный, но живой поток не обрывается', async () => {
+  const server = createServer(async (req, res) => {
+    for await (const _ of req);
+    res.setHeader('Content-Type', 'text/event-stream');
+    const stall = (req.url ?? '').includes('stall');
+    // Живой поток: 5 кусков по 120 мс = 600 мс при таймауте 300 мс; зависший — молчит
+    for (let i = 0; i < (stall ? 1 : 5); i++) {
+      await new Promise((r) => setTimeout(r, stall ? 1000 : 120));
+      if (res.destroyed) return;
+      res.write(`data: ${JSON.stringify({ role: 'assistant', uuid: 'u', content_delta: `${i}` })}\n\n`);
+    }
+    res.end(`data: ${JSON.stringify({ role: 'assistant', uuid: 'u', finished: true })}\n\n`);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const client = new NaparnikClient({ token: 't', baseUrl: `http://127.0.0.1:${port}`, authFormat: 'plain', skillName: 'raw', timeoutMs: 300 });
+  try {
+    const alive = await client.sendMessage('alive', 'q', undefined, { onText: () => {} });
+    assert.equal(alive.text, '01234');
+    await assert.rejects(client.sendMessage('stall', 'q', undefined, { onText: () => {} }), (e: Error) => e.name === 'TimeoutError');
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});

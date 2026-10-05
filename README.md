@@ -18,6 +18,9 @@
 - История чатов
 - Копирование и вставка кода из ответа в редактор
 - «Спросить Напарника» о выделенном коде из контекстного меню
+- Слэш-команды: введите `/` в поле чата — появится список (`/init`, `/rules`, `/make-rules`, `/clear`, `/help` и др.)
+- `/init` — Напарник изучает проект (README, CLAUDE.md, AGENTS.md, правила Cursor/Copilot и код) и создаёт `NAPARNIK.md` — описание, которое подставляется в каждый новый чат
+- Правила проекта в папке `.rules/`: «запомни…» записывает правило, `/make-rules` собирает правила из текущего чата
 
 ## Установка
 
@@ -36,7 +39,7 @@ code --install-extension winst0niuss.naparnik-1c-chat
 | Настройка | По умолчанию | Описание |
 |-----------|--------------|----------|
 | `naparnik.skillName` | `custom` | `custom` — с поиском по ИТС, `raw` — только ответ модели |
-| `naparnik.timeoutSeconds` | `120` | Таймаут запроса, сек |
+| `naparnik.timeoutSeconds` | `300` | Сколько секунд ждать данных от сервера |
 | `naparnik.baseUrl` | `https://code.1c.ai` | Адрес API |
 | `naparnik.authFormat` | `plain` | Формат заголовка Authorization: `plain` или `bearer` |
 

@@ -181,22 +181,32 @@ export class NaparnikClient {
     callbacks: StreamCallbacks,
     signal?: AbortSignal,
   ): Promise<SseParseResult> {
-    const response = await fetch(`${this.baseUrl}/chat_api/v1/conversations/${conversationId}/messages`, {
-      method: 'POST',
-      headers: this.headers('text/event-stream'),
-      body: JSON.stringify(payload),
-      signal: this.withTimeout(signal),
-    });
-    if (!response.ok || !response.body) {
-      throw new ApiError(response.status, await safeText(response));
+    // Таймаут — на паузу в данных, а не на весь ответ: длинный, но идущий ответ не обрываем
+    const idle = new IdleTimeout(this.config.timeoutMs);
+    try {
+      const response = await fetch(`${this.baseUrl}/chat_api/v1/conversations/${conversationId}/messages`, {
+        method: 'POST',
+        headers: this.headers('text/event-stream'),
+        body: JSON.stringify(payload),
+        signal: signal ? AbortSignal.any([signal, idle.signal]) : idle.signal,
+      });
+      if (!response.ok || !response.body) {
+        throw new ApiError(response.status, await safeText(response));
+      }
+      return await this.readStream(response.body, callbacks, idle);
+    } finally {
+      idle.dispose();
     }
+  }
 
+  private async readStream(body: ReadableStream<Uint8Array>, callbacks: StreamCallbacks, idle: IdleTimeout): Promise<SseParseResult> {
     const parser = new SseParser();
     const decoder = new TextDecoder('utf-8');
     let buffer = '';
 
     // Читаем поток кусками и режем на строки: кусок может оборваться посреди строки
-    for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+    for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
+      idle.reset();
       buffer += decoder.decode(chunk, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
@@ -218,6 +228,30 @@ export class NaparnikClient {
   private withTimeout(signal?: AbortSignal): AbortSignal {
     const timeout = AbortSignal.timeout(this.config.timeoutMs);
     return signal ? AbortSignal.any([signal, timeout]) : timeout;
+  }
+}
+
+/** Таймер бездействия: срабатывает, если данных не было дольше ms; reset() — пришли данные */
+class IdleTimeout {
+  private readonly controller = new AbortController();
+  private timer: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(private readonly ms: number) {
+    this.reset();
+  }
+
+  get signal(): AbortSignal {
+    return this.controller.signal;
+  }
+
+  reset(): void {
+    clearTimeout(this.timer);
+    // Ошибка с именем TimeoutError — как у AbortSignal.timeout, её распознаёт чат
+    this.timer = setTimeout(() => this.controller.abort(new DOMException('Нет данных от сервера', 'TimeoutError')), this.ms);
+  }
+
+  dispose(): void {
+    clearTimeout(this.timer);
   }
 }
 

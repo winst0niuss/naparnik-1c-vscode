@@ -2,7 +2,7 @@
   "name": "naparnik-1c-chat",
   "displayName": "Напарник",
   "description": "Неофициальный чат с 1С:Напарник.",
-  "version": "0.4.6",
+  "version": "0.5.2",
   "publisher": "winst0niuss",
   "license": "MIT",
   "icon": "media/marketplace-icon.png",
@@ -162,8 +162,8 @@
         },
         "naparnik.timeoutSeconds": {
           "type": "number",
-          "default": 120,
-          "description": "Таймаут одного HTTP-запроса (сек)"
+          "default": 300,
+          "description": "Сколько секунд ждать данных от сервера, прежде чем прервать ответ. Считается пауза в данных, а не время всего ответа."
         }
       }
     }

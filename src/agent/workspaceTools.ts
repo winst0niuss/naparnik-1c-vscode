@@ -1,9 +1,14 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { realpath } from 'node:fs/promises';
-import { AgentCommand, applySearchReplace } from './protocol';
+import { AgentCommand, ProjectContext, applySearchReplace } from './protocol';
+import { PROJECT_DOC_DIRS, PROJECT_DOC_FILES, RULES_DIR } from '../slashCommands';
 
 const MAX_FILE_CHARS = 60_000;
+// Документация прикладывается к первому сообщению, только если она короткая
+const MAX_ATTACHED_DOC_CHARS = 4_000;
+const MAX_ATTACHED_TOTAL_CHARS = 12_000;
+const MAX_RULES_TOTAL_CHARS = 12_000;
 const MAX_DIR_ENTRIES = 200;
 const MAX_SEARCH_RESULTS = 50;
 const MAX_SEARCH_FILES = 5_000;
@@ -82,6 +87,70 @@ export class WorkspaceTools {
     };
     await walk(this.root, 0);
     return { text: lines.join('\n') || '(папка пуста)', truncated };
+  }
+
+  /** Документация, инструкции ИИ-инструментов и правила из .rules — для первого сообщения */
+  async projectContext(): Promise<ProjectContext> {
+    const docs: string[] = [];
+    for (const rel of PROJECT_DOC_FILES) {
+      if (await this.exists(vscode.Uri.joinPath(this.root, rel))) docs.push(rel);
+    }
+    for (const dir of PROJECT_DOC_DIRS) {
+      docs.push(...(await this.markdownFilesIn(dir, 20)));
+    }
+
+    // NAPARNIK.md — описание, созданное /init, прикладываем всегда (обрезая), остальное — если короткое
+    const attached: { path: string; text: string }[] = [];
+    let total = 0;
+    for (const rel of docs) {
+      const text = await this.readText(vscode.Uri.joinPath(this.root, rel)).catch(() => '');
+      const limit = rel === 'NAPARNIK.md' ? MAX_ATTACHED_TOTAL_CHARS : MAX_ATTACHED_DOC_CHARS;
+      if (!text || (text.length > limit && rel !== 'NAPARNIK.md') || total + Math.min(text.length, limit) > MAX_ATTACHED_TOTAL_CHARS) continue;
+      attached.push({ path: rel, text: text.slice(0, limit) });
+      total += Math.min(text.length, limit);
+    }
+
+    const rules: { path: string; text: string }[] = [];
+    let rulesTotal = 0;
+    for (const rel of await this.markdownFilesIn(RULES_DIR, 50)) {
+      const text = await this.readText(vscode.Uri.joinPath(this.root, rel)).catch(() => '');
+      if (!text.trim()) continue;
+      const part = text.slice(0, MAX_RULES_TOTAL_CHARS - rulesTotal);
+      if (!part) break;
+      rules.push({ path: rel, text: part });
+      rulesTotal += part.length;
+    }
+    return { docs, attached, rules };
+  }
+
+  /** Список файлов правил .rules/*.md (для /rules) */
+  async ruleFiles(): Promise<vscode.Uri[]> {
+    return (await this.markdownFilesIn(RULES_DIR, 50)).map((rel) => vscode.Uri.joinPath(this.root, rel));
+  }
+
+  get rootUri(): vscode.Uri {
+    return this.root;
+  }
+
+  /** .md/.mdc/.txt в папке (до 2 уровней вложенности) */
+  private async markdownFilesIn(dir: string, limit: number): Promise<string[]> {
+    const found: string[] = [];
+    const walk = async (rel: string, level: number) => {
+      let entries: [string, vscode.FileType][];
+      try {
+        entries = await this.sortedEntries(vscode.Uri.joinPath(this.root, rel));
+      } catch {
+        return; // папки нет
+      }
+      for (const [name, type] of entries) {
+        if (found.length >= limit) return;
+        const child = `${rel}/${name}`;
+        if (type === vscode.FileType.Directory && level < 2) await walk(child, level + 1);
+        else if (type === vscode.FileType.File && /\.(md|mdc|txt)$/i.test(name)) found.push(child);
+      }
+    };
+    await walk(dir, 0);
+    return found;
   }
 
   private async listDir(relPath: string): Promise<string> {

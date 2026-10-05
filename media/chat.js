@@ -17,22 +17,102 @@
   const THINK_FRAMES = ['🤔', '💭', '🧠', '💡'];
   const SEARCH_FRAMES = ['🔍', '📚', '📖', '🔎'];
   const WAIT_FRAMES = ['✋', '👀'];
+  const WRITE_FRAMES = ['✍️', '📝'];
   let statusTimer = null;
+  let statusStarted = 0;
+
+  // Слэш-команды: список приходит из расширения
+  const slashMenu = document.getElementById('slash-menu');
+  let commands = [];
+  let menuItems = [];
+  let menuIndex = 0;
 
   form.addEventListener('submit', (e) => {
     e.preventDefault();
     const text = input.value.trim();
-    if (!text || sendBtn.disabled) return;
+    // Пока идёт ответ, вопросы не отправляем, а слэш-команды (/stop, /exit, /help…) — можно
+    if (!text || (sendBtn.disabled && !text.startsWith('/'))) return;
     vscode.postMessage({ type: 'send', text });
     input.value = '';
   });
 
   input.addEventListener('keydown', (e) => {
+    if (!slashMenu.classList.contains('hidden')) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        menuIndex = (menuIndex + (e.key === 'ArrowDown' ? 1 : -1) + menuItems.length) % menuItems.length;
+        renderMenu();
+        return;
+      }
+      if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey && !e.isComposing)) {
+        e.preventDefault();
+        chooseCommand(menuItems[menuIndex], e.key === 'Enter');
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        hideMenu();
+        return;
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       form.requestSubmit();
     }
   });
+
+  // Меню показывается, пока введено только «/команда» без пробела
+  input.addEventListener('input', updateMenu);
+  input.addEventListener('blur', () => setTimeout(hideMenu, 150));
+  slashMenu.addEventListener('mousedown', (e) => {
+    const item = e.target.closest('[data-index]');
+    if (!item) return;
+    e.preventDefault();
+    chooseCommand(menuItems[Number(item.dataset.index)], true);
+  });
+
+  function updateMenu() {
+    const m = input.value.match(/^\/([\w-]*)$/);
+    if (!m || commands.length === 0) return hideMenu();
+    const query = m[1].toLowerCase();
+    menuItems = commands.filter((c) => c.name.startsWith(query));
+    if (menuItems.length === 0) return hideMenu();
+    menuIndex = Math.min(menuIndex, menuItems.length - 1);
+    renderMenu();
+    slashMenu.classList.remove('hidden');
+  }
+
+  function renderMenu() {
+    slashMenu.innerHTML = '';
+    menuItems.forEach((c, i) => {
+      const row = document.createElement('div');
+      row.className = 'slash-item' + (i === menuIndex ? ' active' : '');
+      row.dataset.index = i;
+      const name = document.createElement('span');
+      name.className = 'slash-name';
+      name.textContent = '/' + c.name;
+      const desc = document.createElement('span');
+      desc.className = 'slash-desc';
+      desc.textContent = c.description;
+      row.append(name, desc);
+      slashMenu.appendChild(row);
+    });
+    slashMenu.querySelector('.active')?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function hideMenu() {
+    slashMenu.classList.add('hidden');
+    menuIndex = 0;
+  }
+
+  /** Выбор команды: Enter — сразу выполнить, Tab — только дописать в поле */
+  function chooseCommand(command, run) {
+    if (!command) return;
+    hideMenu();
+    input.value = '/' + command.name + (command.args ? ' ' : '');
+    if (run && !command.args) form.requestSubmit();
+    else input.focus();
+  }
 
   stopBtn.addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
   projectToggle.addEventListener('click', () => vscode.postMessage({ type: 'toggleProject' }));
@@ -71,6 +151,12 @@
         stopStatus();
         messagesEl.innerHTML = '';
         setBusy(false);
+        break;
+      case 'commands':
+        commands = msg.list || [];
+        break;
+      case 'info':
+        addInfo(msg.text);
         break;
       case 'tokenState':
         tokenBanner.classList.toggle('hidden', msg.hasToken);
@@ -139,12 +225,15 @@
         break;
       case 'assistantText':
         if (!currentAnswer) break;
-        if (msg.text) {
-          currentAnswer.innerHTML = renderMarkdown(msg.text);
-        } else {
+        currentAnswer.innerHTML = msg.text ? renderMarkdown(msg.text) : '';
+        if (msg.writing && currentStatus) {
+          // Модель пишет файл: его текст скрыт, под уже напечатанным текстом показываем прогресс
+          const w = msg.writing;
+          setStatus((w.isNew ? 'Пишет ' : 'Готовит правку ') + w.path + ' · ' + w.chars.toLocaleString('ru-RU') + ' симв.', WRITE_FRAMES);
+          currentAnswer.appendChild(currentStatus);
+        } else if (!msg.text && currentStatus) {
           // Новый шаг агентного цикла: возвращаем статус вместо текста
-          currentAnswer.innerHTML = '';
-          if (currentStatus) currentAnswer.appendChild(currentStatus);
+          currentAnswer.appendChild(currentStatus);
         }
         scrollToBottom();
         break;
@@ -153,8 +242,9 @@
         finishAnswer();
         break;
       case 'error':
-        // Блок ответа без текста (только статус «думает») убираем — вместо него будет ошибка
-        if (currentAnswer && (!currentStatus || currentAnswer.contains(currentStatus))) currentAnswer.remove();
+        // Статус убираем; уже напечатанный текст ответа оставляем, пустой блок — удаляем
+        currentStatus?.remove();
+        if (currentAnswer && !currentAnswer.textContent.trim()) currentAnswer.remove();
         addError(msg.message);
         finishAnswer();
         break;
@@ -176,14 +266,14 @@
     return el;
   }
 
-  /** Текст статуса и набор эмодзи; секундомер идёт с момента начала ответа */
+  /** Текст статуса и набор эмодзи. Секундомер считает текущий этап: при смене этапа начинается заново */
   function setStatus(text, frames) {
     if (!currentStatus) return;
     currentStatus.querySelector('.status-text').textContent = text;
+    if (currentStatus.frames !== frames) statusStarted = Date.now();
     currentStatus.frames = frames;
     if (statusTimer) return;
 
-    const started = Date.now();
     let tick = 0;
     const render = () => {
       // Статус мог быть снят со страницы, когда пошёл текст ответа — тогда просто ждём
@@ -192,7 +282,7 @@
       const frames = el.frames || THINK_FRAMES;
       el.querySelector('.status-emoji').textContent = frames[Math.floor(tick / 2) % frames.length];
       el.querySelector('.status-dots').textContent = '.'.repeat((tick % 3) + 1);
-      const seconds = Math.floor((Date.now() - started) / 1000);
+      const seconds = Math.floor((Date.now() - statusStarted) / 1000);
       el.querySelector('.status-time').textContent = seconds >= 3 ? seconds + ' с' : '';
       tick++;
     };
@@ -228,6 +318,12 @@
     el.textContent = text;
     if (before) messagesEl.insertBefore(el, before);
     else messagesEl.appendChild(el);
+    scrollToBottom();
+  }
+
+  function addInfo(markdown) {
+    const el = addMessage('info');
+    el.innerHTML = renderMarkdown(markdown);
     scrollToBottom();
   }
 

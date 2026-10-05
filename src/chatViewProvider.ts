@@ -447,7 +447,7 @@ function errorMessage(err: unknown): string {
     // fetch оборачивает сетевые ошибки в TypeError с причиной в cause
     const cause = (err as { cause?: unknown }).cause;
     if (err.name === 'TimeoutError') {
-      return 'Превышен таймаут ответа. Его можно увеличить в настройке naparnik.timeoutSeconds.';
+      return 'Превышено время ожидания ответа.';
     }
     return cause instanceof Error ? `${err.message}: ${cause.message}` : err.message;
   }

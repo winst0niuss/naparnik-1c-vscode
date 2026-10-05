@@ -170,6 +170,7 @@
           else if (entry.role === 'step') addStep(entry.text);
           else addError(entry.text);
         }
+        closeStepGroups();
         break;
       case 'clear':
         stopStatus();
@@ -293,6 +294,7 @@
   });
 
   function finishAnswer() {
+    closeStepGroups();
     stopStatus();
     currentAnswer = null;
     currentStatus = null;
@@ -370,13 +372,63 @@
     }
   }
 
+  /**
+   * Шаги работы с проектом («Читаю…», «Смотрю…») собираются в свёрнутую группу:
+   * пока идёт ответ — видно последний шаг и счётчик, после ответа — сводка. Клик разворачивает список.
+   */
   function addStep(text, before) {
-    const el = document.createElement('div');
-    el.className = 'step';
-    el.textContent = text;
-    if (before) messagesEl.insertBefore(el, before);
-    else messagesEl.appendChild(el);
+    // Продолжаем открытую группу, если она стоит прямо перед местом вставки
+    const prev = before ? before.previousElementSibling : messagesEl.lastElementChild;
+    let group = prev && prev.classList.contains('steps') && !prev.classList.contains('closed') ? prev : null;
+    if (!group) {
+      group = createStepGroup();
+      if (before) messagesEl.insertBefore(group, before);
+      else messagesEl.appendChild(group);
+    }
+    const step = document.createElement('div');
+    step.className = 'step';
+    step.textContent = text;
+    group.querySelector('.steps-list').appendChild(step);
+    const count = group.querySelectorAll('.step').length;
+    group.querySelector('.steps-summary').textContent = text + (count > 1 ? ' · ещё ' + (count - 1) : '');
     scrollToBottom();
+  }
+
+  function createStepGroup() {
+    const group = document.createElement('div');
+    group.className = 'steps';
+    const header = document.createElement('div');
+    header.className = 'steps-header';
+    header.innerHTML = '<span class="steps-arrow">▸</span><span class="steps-summary"></span>';
+    const list = document.createElement('div');
+    list.className = 'steps-list';
+    header.addEventListener('click', () => group.classList.toggle('expanded'));
+    group.append(header, list);
+    return group;
+  }
+
+  /** Ответ готов: открытые группы шагов превращаются в сводку «Просмотрено: 12 папок, 3 файла» */
+  function closeStepGroups() {
+    for (const group of messagesEl.querySelectorAll('.steps:not(.closed)')) {
+      group.classList.add('closed');
+      const steps = [...group.querySelectorAll('.step')].map((s) => s.textContent);
+      group.querySelector('.steps-summary').textContent = summarizeSteps(steps);
+    }
+  }
+
+  function summarizeSteps(steps) {
+    const count = (prefix) => steps.filter((s) => s.startsWith(prefix)).length;
+    const parts = [
+      [count('📂'), 'папку', 'папки', 'папок'],
+      [count('📄'), 'файл', 'файла', 'файлов'],
+      [count('🔍'), 'поиск', 'поиска', 'поисков'],
+    ]
+      .filter(([n]) => n > 0)
+      .map(([n, one, few, many]) => n + ' ' + plural(n, one, few, many));
+    const edits = count('✏️') + count('🆕');
+    const viewed = parts.length > 0 ? 'Просмотрено: ' + parts.join(', ') : '';
+    const proposed = edits > 0 ? 'предложено правок: ' + edits : '';
+    return [viewed, proposed].filter(Boolean).join('; ').replace(/^п/, 'П') || steps.length + ' ' + plural(steps.length, 'шаг', 'шага', 'шагов');
   }
 
   function addInfo(markdown) {

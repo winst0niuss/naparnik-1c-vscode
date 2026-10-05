@@ -8,6 +8,8 @@ export interface PendingEdit {
   /** Путь относительно проекта — для карточки в чате */
   label: string;
   isNew: boolean;
+  /** Чат, в котором предложена правка: карточка показывается только в нём */
+  owner?: string;
 }
 
 /**
@@ -21,7 +23,7 @@ export class EditPreview implements vscode.TextDocumentContentProvider {
   private counter = 0;
 
   private readonly startEmitter = new vscode.EventEmitter<PendingEdit>();
-  private readonly endEmitter = new vscode.EventEmitter<{ id: number; accepted: boolean }>();
+  private readonly endEmitter = new vscode.EventEmitter<{ id: number; accepted: boolean; owner?: string }>();
   /** Появилась правка, ожидающая решения */
   readonly onDidStart = this.startEmitter.event;
   /** Пользователь принял решение */
@@ -50,7 +52,14 @@ export class EditPreview implements vscode.TextDocumentContentProvider {
     if (id) this.resolve(id, accepted);
   }
 
-  confirm = async (target: vscode.Uri, original: string, proposed: string, isNew: boolean, signal?: AbortSignal): Promise<boolean> => {
+  confirm = async (
+    target: vscode.Uri,
+    original: string,
+    proposed: string,
+    isNew: boolean,
+    signal?: AbortSignal,
+    owner?: string,
+  ): Promise<boolean> => {
     const name = path.basename(target.fsPath);
     const label = vscode.workspace.asRelativePath(target);
     // Уникальный id: одну и ту же правку модель может прислать несколько раз
@@ -74,10 +83,10 @@ export class EditPreview implements vscode.TextDocumentContentProvider {
       const title = isNew ? `Напарник: новый файл ${name}` : `Напарник: правка ${name}`;
       // preserveFocus: фокус остаётся в чате — Enter там сразу применяет правку
       await vscode.commands.executeCommand('vscode.diff', left, right, title, { preview: true, preserveFocus: true });
-      this.startEmitter.fire({ id, label, isNew });
+      this.startEmitter.fire({ id, label, isNew, owner });
 
       const accepted = await decision;
-      this.endEmitter.fire({ id, accepted });
+      this.endEmitter.fire({ id, accepted, owner });
       return accepted;
     } finally {
       signal?.removeEventListener('abort', onAbort);

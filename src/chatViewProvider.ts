@@ -78,13 +78,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.editorContextUri = uri;
       this.postEditorContext();
     });
+    // Карточка правки — только в чате, где её предложили: иначе Enter в другом чате применил бы чужую правку
     preview.onDidStart((edit) => {
       this.pendingEdits.set(edit.id, edit);
-      this.post({ type: 'editPending', ...edit });
+      if (edit.owner === this.chat.id) this.post({ type: 'editPending', ...edit });
     });
-    preview.onDidEnd(({ id, accepted }) => {
+    preview.onDidEnd(({ id, accepted, owner }) => {
       this.pendingEdits.delete(id);
-      this.post({ type: 'editResolved', id, accepted });
+      if (owner === this.chat.id) this.post({ type: 'editResolved', id, accepted });
     });
   }
 
@@ -192,7 +193,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (run.toolNames) this.post({ type: 'toolCalls', names: run.toolNames });
       if (run.partial) this.post({ type: 'assistantText', text: run.partial });
     }
-    this.pendingEdits.forEach((edit) => this.post({ type: 'editPending', ...edit }));
+    this.pendingEdits.forEach((edit) => {
+      if (edit.owner === this.chat.id) this.post({ type: 'editPending', ...edit });
+    });
   }
 
   /** Чип над полем ввода: какой файл и выделение будут приложены к следующему сообщению */
@@ -467,7 +470,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const client = new NaparnikClient({ token, ...readSettings() });
       chat.conversationId ??= await client.createConversation(run.abort.signal);
 
-      const tools = this.projectAccess ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm, run.abort.signal) : undefined;
+      const tools = this.projectAccess ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm, run.abort.signal, chat.id) : undefined;
       // Контекст редактора — перед вопросом: модель сразу видит, о каком файле и фрагменте речь.
       // Тот же неизменённый файл повторно не шлём — модель уже видела его в этом чате
       let editorBlock = editorSnap ? formatEditorContext(editorSnap) : '';

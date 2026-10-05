@@ -219,9 +219,53 @@ a {
   color: var(--vscode-textLink-foreground);
 }
 
-.step {
-  margin: 2px 0 2px 10px;
+/* Группа шагов работы с проектом: свёрнута, клик по заголовку — развернуть */
+.steps {
+  margin: 4px 0 4px 6px;
   font-size: 12px;
+}
+
+.steps-header {
+  display: flex;
+  gap: 6px;
+  cursor: pointer;
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.steps-header:hover {
+  opacity: 1;
+}
+
+.steps-summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.steps-arrow {
+  display: inline-block;
+  transition: transform 0.15s;
+}
+
+.steps.expanded .steps-arrow {
+  transform: rotate(90deg);
+}
+
+.steps-list {
+  display: none;
+  max-height: 240px;
+  overflow-y: auto;
+  margin: 2px 0 0 16px;
+  border-left: 1px solid var(--vscode-panel-border);
+  padding-left: 8px;
+}
+
+.steps.expanded .steps-list {
+  display: block;
+}
+
+.step {
   opacity: 0.7;
   white-space: nowrap;
   overflow: hidden;

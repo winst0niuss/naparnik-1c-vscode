@@ -18,7 +18,14 @@ const MAX_SEARCH_FILE_BYTES = 1_000_000;
 const IGNORED_DIRS = new Set(['.git', 'node_modules', 'out', 'dist', '.vscode-test']);
 
 /** Решение пользователя по предложенной правке. signal — запрос остановили, ждать решения больше не нужно */
-export type ConfirmEdit = (uri: vscode.Uri, original: string, proposed: string, isNew: boolean, signal?: AbortSignal) => Promise<boolean>;
+export type ConfirmEdit = (
+  uri: vscode.Uri,
+  original: string,
+  proposed: string,
+  isNew: boolean,
+  signal?: AbortSignal,
+  owner?: string,
+) => Promise<boolean>;
 
 /**
  * Выполнение команд Напарника в открытой папке.
@@ -29,11 +36,13 @@ export class WorkspaceTools {
     private readonly root: vscode.Uri,
     private readonly confirmEdit: ConfirmEdit,
     private readonly signal?: AbortSignal,
+    // id чата — к нему привязываются карточки правок
+    private readonly owner?: string,
   ) {}
 
-  static forCurrentWorkspace(confirmEdit: ConfirmEdit, signal?: AbortSignal): WorkspaceTools | undefined {
+  static forCurrentWorkspace(confirmEdit: ConfirmEdit, signal?: AbortSignal, owner?: string): WorkspaceTools | undefined {
     const folder = vscode.workspace.workspaceFolders?.[0];
-    return folder ? new WorkspaceTools(folder.uri, confirmEdit, signal) : undefined;
+    return folder ? new WorkspaceTools(folder.uri, confirmEdit, signal, owner) : undefined;
   }
 
   /** Выполнить команду и вернуть текст результата для модели (ошибки — тоже текстом) */
@@ -215,7 +224,7 @@ export class WorkspaceTools {
     const uri = await this.resolve(relPath);
     const original = await this.readText(uri);
     const proposed = applySearchReplace(original, edits);
-    if (!(await this.confirmEdit(uri, original, proposed, false, this.signal))) {
+    if (!(await this.confirmEdit(uri, original, proposed, false, this.signal, this.owner))) {
       return `Пользователь отклонил правку ${relPath}.`;
     }
     // Пока пользователь смотрел diff, файл могли изменить — не затираем эти изменения
@@ -231,7 +240,7 @@ export class WorkspaceTools {
     if (await this.exists(uri)) {
       return `Ошибка: файл ${relPath} уже существует. Для изменения используй edit_file.`;
     }
-    if (!(await this.confirmEdit(uri, '', content, true, this.signal))) {
+    if (!(await this.confirmEdit(uri, '', content, true, this.signal, this.owner))) {
       return `Пользователь отклонил создание ${relPath}.`;
     }
     if (await this.exists(uri)) {

@@ -9,6 +9,7 @@ import {
   buildImportPrompt,
   classifyProjectFile,
   describeFile,
+  importDone,
   makeFoundFile,
   parseImportArgs,
   readUserFiles,
@@ -117,4 +118,11 @@ test('readUserFiles: только существующие непустые фа
     files.map((f) => [f.source, f.path, f.text, f.user]),
     [['claude', '~/.claude/CLAUDE.md', 'общие правила', true]],
   );
+});
+
+test('importDone: выполнено, только если записано в .rules', () => {
+  assert.ok(importDone([]));
+  assert.ok(importDone([{ kind: 'read_file', path: '.rules/git.md' }]));
+  assert.ok(importDone([{ kind: 'create_file', path: 'NAPARNIK.md' }]));
+  assert.equal(importDone([{ kind: 'edit_file', path: '.rules/git.md' }]), undefined);
 });

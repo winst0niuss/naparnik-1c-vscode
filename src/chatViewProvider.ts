@@ -22,6 +22,7 @@ import {
   ImportState,
   buildImportPrompt,
   classifyProjectFile,
+  importDone,
   makeFoundFile,
   parseImportArgs,
   readUserFiles,
@@ -400,7 +401,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     if (!(await this.ensureProjectAccess('/import'))) return;
 
-    const done = await this.send(`/import ${sources.join(' ')}`, buildImportPrompt(selection), false, EXPLORE_MAX_STEPS);
+    const done = await this.send(`/import ${sources.join(' ')}`, buildImportPrompt(selection), false, EXPLORE_MAX_STEPS, importDone);
     if (done) {
       // Запоминаем переданные файлы: повторный /import возьмёт только новое и изменившееся
       const next = { ...this.workspaceState.get<ImportState>(IMPORT_STATE_KEY, {}) };

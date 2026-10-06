@@ -87,8 +87,3 @@ export function formatMentionedFiles(files: { path: string; text: string }[]): {
         (skipped.length ? `\n\nНе приложены из-за объёма: ${skipped.join(', ')}` : '');
   return { text, skipped };
 }
-
-/** Путь для вставки в поле ввода: с пробелами — в кавычках */
-export function mentionToken(path: string): string {
-  return /\s/.test(path) ? `@"${path}"` : `@${path}`;
-}

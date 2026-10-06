@@ -3,6 +3,7 @@ import * as assert from 'node:assert/strict';
 import {
   applySearchReplace,
   buildAgentPrompt,
+  emulatedCommand,
   changedCode,
   describeCommand,
   findUnfinishedWrite,
@@ -252,4 +253,15 @@ test('блок правки, закрытый «=======» вместо «>>>>>>>
   assert.deepEqual(unclosed, [{ kind: 'edit_file', path: 'm.bsl', edits: [{ search: 'А = 1;', replace: 'А = 2;' }] }]);
   const two = parseCommands('@edit_file m.bsl\n<<<<<<< SEARCH\nА\n=======\nБ\n<<<<<<< SEARCH\nВ\n=======\nГ\n@end');
   assert.deepEqual(two[0].kind === 'edit_file' && two[0].edits, [{ search: 'А', replace: 'Б' }, { search: 'В', replace: 'Г' }]);
+});
+
+test('ReadSystemFile и WriteSystemFile выполняются как @-команды, остальные инструменты EDT — нет', () => {
+  const call = (name: string, args: object | string) => ({ function: { name, arguments: typeof args === 'string' ? args : JSON.stringify(args) } });
+  assert.deepEqual(emulatedCommand(call('ReadSystemFile', { path: 'attachment://README.md' })), { kind: 'read_file', path: 'README.md' });
+  assert.deepEqual(emulatedCommand(call('ReadSystemFile', { file_path: 'src/a.bsl' })), { kind: 'read_file', path: 'src/a.bsl' });
+  assert.equal(emulatedCommand(call('ReadSystemFile', 'не json')), undefined);
+  assert.equal(emulatedCommand(call('ReadSystemFile', { path: '129a6f8e-8537-4e9e-9b4d-0a36ea6d37ee' })), undefined);
+  assert.deepEqual(emulatedCommand(call('WriteSystemFile', { path: 'NAPARNIK.md', content: '# Проект' })), { kind: 'create_file', path: 'NAPARNIK.md', content: '# Проект' });
+  assert.equal(emulatedCommand(call('WriteSystemFile', { path: 'a.md' })), undefined);
+  assert.equal(emulatedCommand(call('Task', { prompt: 'изучи проект' })), undefined);
 });

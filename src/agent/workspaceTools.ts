@@ -16,6 +16,8 @@ const MAX_SEARCH_RESULTS = 50;
 const MAX_SEARCH_FILES = 5_000;
 // Большие файлы (выгрузки XML, логи) при поиске пропускаем — иначе поиск идёт минутами
 const MAX_SEARCH_FILE_BYTES = 1_000_000;
+// Файлы для поиска читаем пачками параллельно: по одному поиск по 2–3 тыс. файлов шёл ~0,8 с
+const SEARCH_BATCH = 32;
 const TREE_MAX_LINES = 250;
 const TREE_MAX_DEPTH = 4;
 const TREE_FULL_DEPTH = 12;
@@ -289,25 +291,18 @@ export class WorkspaceTools {
     const needle = query.toLowerCase();
     const results: string[] = [];
 
-    for (const file of files) {
+    for await (const [file, text] of this.searchableTexts(files)) {
       if (results.length >= MAX_SEARCH_RESULTS) break;
       // Совпадение в пути: ищут часто по имени объекта, а не по тексту
       const rel = this.relative(file);
       if (rel.toLowerCase().includes(needle)) {
         results.push(`${rel} (совпадение в пути)`);
       }
-
-      let text: string;
-      try {
-        if ((await vscode.workspace.fs.stat(file)).size > MAX_SEARCH_FILE_BYTES) continue;
-        text = await this.readText(file);
-      } catch {
-        continue; // бинарный или нечитаемый файл
-      }
+      if (text === undefined) continue;
       const lines = text.split(/\r?\n/);
       for (let i = 0; i < lines.length && results.length < MAX_SEARCH_RESULTS; i++) {
         if (lines[i].toLowerCase().includes(needle)) {
-          results.push(`${this.relative(file)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+          results.push(`${rel}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
         }
       }
     }
@@ -410,18 +405,30 @@ export class WorkspaceTools {
   /** Есть ли в текстовых файлах проекта упоминания старого пути (после переноса) */
   private async describeReferences(oldRel: string): Promise<string> {
     const hits: string[] = [];
-    for (const file of await this.collectFiles(undefined, MAX_SEARCH_FILES)) {
+    for await (const [file, text] of this.searchableTexts(await this.collectFiles(undefined, MAX_SEARCH_FILES))) {
       if (hits.length >= 10) break;
-      try {
-        if ((await vscode.workspace.fs.stat(file)).size > MAX_SEARCH_FILE_BYTES) continue;
-        if ((await this.readText(file)).includes(oldRel)) hits.push(this.relative(file));
-      } catch {
-        // бинарный или нечитаемый файл
-      }
+      if (text?.includes(oldRel)) hits.push(this.relative(file));
     }
     return hits.length === 0
       ? 'Упоминаний старого пути в файлах проекта нет.'
       : `Старый путь «${oldRel}» упоминается в: ${hits.join(', ')} — предложи пользователю обновить эти ссылки.`;
+  }
+
+  /** Тексты файлов по порядку (пачками параллельно); большой, бинарный или нечитаемый файл — undefined */
+  private async *searchableTexts(files: vscode.Uri[]): AsyncGenerator<[vscode.Uri, string | undefined]> {
+    const read = async (file: vscode.Uri) => {
+      try {
+        if ((await vscode.workspace.fs.stat(file)).size > MAX_SEARCH_FILE_BYTES) return undefined;
+        return await this.readText(file);
+      } catch {
+        return undefined;
+      }
+    };
+    for (let i = 0; i < files.length; i += SEARCH_BATCH) {
+      const batch = files.slice(i, i + SEARCH_BATCH);
+      const texts = await Promise.all(batch.map(read));
+      for (let j = 0; j < batch.length; j++) yield [batch[j], texts[j]];
+    }
   }
 
   /** Все файлы внутри папки (включая игнорируемые git — переносятся и они), пути от корня */

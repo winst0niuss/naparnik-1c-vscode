@@ -104,7 +104,7 @@ test('429: понятное сообщение без технических п�
   }
 });
 
-test('пустой ответ после отклонённого инструмента: один раз просим продолжить, затем ответ', async () => {
+test('пустой ответ после отклонённого инструмента: просим продолжить, затем ответ', async () => {
   let calls = 0;
   const mock = await startMock((path) => {
     if (path.endsWith('/conversations/')) return { json: { uuid: 'conv-1' } };
@@ -117,7 +117,7 @@ test('пустой ответ после отклонённого инструм
   });
   try {
     const id = await mock.client.createConversation();
-    const answer = await mock.client.sendMessage(id, 'Вопрос', undefined, { onText: () => {}, emptyAnswerHint: 'продолжи командами' });
+    const answer = await mock.client.sendMessage(id, 'Вопрос', undefined, { onText: () => {}, continueHint: 'продолжи командами' });
     assert.deepEqual(answer, { text: '@read_file a.md', assistantUuid: 'asst-3' });
     const retry = mock.requests[3].body;
     assert.equal(retry.role, 'user');
@@ -136,7 +136,7 @@ test('пустой ответ повторно или без uuid — ошибк
   try {
     const id = await mock.client.createConversation();
     await assert.rejects(mock.client.sendMessage(id, 'Вопрос', undefined, { onText: () => {} }), /не вернул текстовый ответ/);
-    assert.equal(mock.requests.length, 3); // дискуссия + вопрос + одно напоминание
+    assert.equal(mock.requests.length, 4); // дискуссия + вопрос + два напоминания
     const id2 = await noUuid.client.createConversation();
     await assert.rejects(noUuid.client.sendMessage(id2, 'Вопрос', undefined, { onText: () => {} }), /не вернул текстовый ответ/);
     assert.equal(noUuid.requests.length, 2); // продолжать не от чего — вопрос не теряем
@@ -260,4 +260,115 @@ test('TodoWrite и инструменты поиска разрешены, ин�
   const { isUsableServerTool } = await import('../api/client');
   for (const n of ['TodoWrite', 'mcp__knowledge-hub__Search_ITS', 'mcp__syntax-checker__validate']) assert.ok(isUsableServerTool(n), n);
   for (const n of ['WriteSystemFile', 'GetObject_in_Project', 'Task', undefined]) assert.ok(!isUsableServerTool(n), String(n));
+});
+
+test('зацикливание на TodoWrite и отклонённых инструментах: просим продолжить от пользователя, а не упираемся в лимит', async () => {
+  let calls = 0;
+  const mock = await startMock((path, body) => {
+    if (path.endsWith('/conversations/')) return { json: { uuid: 'conv-1' } };
+    calls++;
+    // Модель отвечает текстом только на просьбу пользователя продолжить
+    if (body.role === 'user' && calls > 1) return { sse: [{ role: 'assistant', uuid: 'asst-end', content: { content: 'Готово' }, finished: true }] };
+    const name = calls % 2 ? 'TodoWrite' : 'Task';
+    return { sse: [{ role: 'assistant', uuid: `asst-${calls}`, content: { tool_calls: [{ id: `c-${calls}`, function: { name } }] }, finished: true }] };
+  });
+  try {
+    const id = await mock.client.createConversation();
+    const answer = await mock.client.sendMessage(id, 'Вопрос', undefined, { onText: () => {}, continueHint: 'продолжи сам' });
+    assert.equal(answer.text, 'Готово');
+    const sent = mock.requests.slice(1).map((r) => r.body);
+    // вопрос, два ответа инструментам, затем после третьего бесполезного раунда — сообщение пользователя
+    assert.deepEqual(sent.map((b) => b.role), ['user', 'tool', 'tool', 'user']);
+    assert.equal(sent[3].parent_uuid, 'asst-3');
+    assert.equal(sent[3].content.content.instruction, 'продолжи сам');
+  } finally {
+    mock.close();
+  }
+});
+
+test('разные поиски по ИТС не считаются зацикливанием', async () => {
+  let calls = 0;
+  const mock = await startMock((path) => {
+    if (path.endsWith('/conversations/')) return { json: { uuid: 'conv-1' } };
+    calls++;
+    if (calls === 6) return { sse: [{ role: 'assistant', uuid: 'asst-end', content: { content: 'Нашёл' }, finished: true }] };
+    return { sse: [{ role: 'assistant', uuid: `asst-${calls}`, content: { tool_calls: [{ id: `c-${calls}`, function: { name: 'mcp__knowledge-hub__Search_ITS', arguments: `{"query":"запрос ${calls}"}` } }] }, finished: true }] };
+  });
+  try {
+    const id = await mock.client.createConversation();
+    assert.equal((await mock.client.sendMessage(id, 'Вопрос', undefined, { onText: () => {} })).text, 'Нашёл');
+    assert.ok(mock.requests.slice(2).every((r) => r.body.role === 'tool'));
+  } finally {
+    mock.close();
+  }
+});
+
+test('недоступный инструмент, который расширение выполняет само: результат уходит модели, а не отказ', async () => {
+  let calls = 0;
+  const mock = await startMock((path) => {
+    if (path.endsWith('/conversations/')) return { json: { uuid: 'conv-1' } };
+    calls++;
+    if (calls === 1) {
+      return { sse: [{ role: 'assistant', uuid: 'asst-1', content: { tool_calls: [{ id: 'c-1', function: { name: 'ReadSystemFile' } }, { id: 'c-2', function: { name: 'Task' } }] }, finished: true }] };
+    }
+    return { sse: [{ role: 'assistant', uuid: 'asst-2', content: { content: 'Прочитал' }, finished: true }] };
+  });
+  try {
+    const rejected: string[] = [];
+    const id = await mock.client.createConversation();
+    await mock.client.sendMessage(id, 'Вопрос', undefined, {
+      onText: () => {},
+      onRejectedTools: (n) => rejected.push(...n),
+      unavailableToolHint: 'нельзя',
+      emulateTool: async (tc) => (tc.function?.name === 'ReadSystemFile' ? 'текст файла' : undefined),
+    });
+    assert.deepEqual(mock.requests[2].body.content, [
+      { tool_call_id: 'c-1', status: 'rejected', content: 'текст файла' },
+      { tool_call_id: 'c-2', status: 'rejected', content: 'нельзя' },
+    ]);
+    assert.deepEqual(rejected, ['Task']);
+  } finally {
+    mock.close();
+  }
+});
+
+test('повтор того же вызова инструмента считается зацикливанием', async () => {
+  let calls = 0;
+  const mock = await startMock((path, body) => {
+    if (path.endsWith('/conversations/')) return { json: { uuid: 'conv-1' } };
+    calls++;
+    if (body.role === 'user' && calls > 1) return { sse: [{ role: 'assistant', uuid: 'asst-end', content: { content: 'Готово' }, finished: true }] };
+    const call = { id: `c-${calls}`, function: { name: 'mcp__knowledge-hub__Search_ITS', arguments: '{"query":"одно и то же"}' } };
+    return { sse: [{ role: 'assistant', uuid: `asst-${calls}`, content: { tool_calls: [call] }, finished: true }] };
+  });
+  try {
+    const id = await mock.client.createConversation();
+    assert.equal((await mock.client.sendMessage(id, 'Вопрос', undefined, { onText: () => {} })).text, 'Готово');
+    // первый поиск полезен, затем три повтора подряд — просьба продолжить
+    assert.deepEqual(mock.requests.slice(1).map((r) => r.body.role), ['user', 'tool', 'tool', 'tool', 'user']);
+  } finally {
+    mock.close();
+  }
+});
+
+test('зацикливание после просьбы продолжить: вопрос задаётся заново от прежнего ответа, без зацикленной ветки', async () => {
+  let calls = 0;
+  const mock = await startMock((path, body) => {
+    if (path.endsWith('/conversations/')) return { json: { uuid: 'conv-1' } };
+    calls++;
+    if (body.role === 'user' && body.content.content.instruction.startsWith('Вопрос')) {
+      if (calls > 1) return { sse: [{ role: 'assistant', uuid: 'asst-end', content: { content: 'Готово' }, finished: true }] };
+    }
+    return { sse: [{ role: 'assistant', uuid: `asst-${calls}`, content: { tool_calls: [{ id: `c-${calls}`, function: { name: 'TodoWrite' } }] }, finished: true }] };
+  });
+  try {
+    const id = await mock.client.createConversation();
+    const answer = await mock.client.sendMessage(id, 'Вопрос', 'prev-answer', { onText: () => {}, continueHint: 'продолжи сам' });
+    assert.equal(answer.text, 'Готово');
+    const last = mock.requests.at(-1)!.body;
+    assert.equal(last.parent_uuid, 'prev-answer');
+    assert.equal(last.content.content.instruction, 'Вопрос\n\nпродолжи сам');
+  } finally {
+    mock.close();
+  }
 });

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { SseParser, stripThinkingTags, unwrapToolResult } from '../api/sseParser';
+import { SseParser, stripThinkingTags } from '../api/sseParser';
 
 function parse(...events: object[]) {
   const parser = new SseParser();
@@ -16,16 +16,16 @@ test('content_delta накапливается построчно', () => {
   assert.equal(p.result().text, 'Привет, мир');
 });
 
-test('финальный content.text важнее накопленных дельт', () => {
-  const p = parse({ content_delta: 'черновик' }, { role: 'assistant', content: { text: 'итог' }, finished: true });
+test('финальный content.content важнее накопленных дельт', () => {
+  const p = parse({ content_delta: { content: 'черно' } }, { role: 'assistant', uuid: 'a-1', content: { content: 'итог' }, content_delta: { content: 'вик' }, finished: true });
   assert.equal(p.result().text, 'итог');
-  assert.ok(p.done);
+  assert.equal(p.result().assistantUuid, 'a-1');
 });
 
-test('echo пользователя с finished=true не завершает поток', () => {
-  const p = parse({ role: 'user', finished: true, content: { content: { instruction: 'вопрос' } } });
-  assert.equal(p.done, false);
-  assert.equal(p.result().text, '');
+test('echo вопроса пользователя пропускается', () => {
+  const p = parse({ role: 'user', uuid: 'u-1', finished: true, content: null }, { role: 'assistant', uuid: 'a-1', content: { content: 'ответ' }, finished: true });
+  assert.equal(p.result().text, 'ответ');
+  assert.equal(p.result().assistantUuid, 'a-1');
 });
 
 test('результат инструмента после ACK пропускается, ждём ответ ассистента', () => {
@@ -37,46 +37,51 @@ test('результат инструмента после ACK пропуска�
     { uuid: 'a-2', role: null, content_delta: { content: 'стандарт' } },
     { uuid: 'a-2', role: 'assistant', content: { content: 'Нашёл стандарт', tool_calls: null }, finished: true },
   );
-  assert.ok(p.done);
   assert.equal(p.result().text, 'Нашёл стандарт');
   assert.equal(p.result().hasToolCalls, false);
 });
 
-test('OpenAI-формат: текст и фрагменты tool_calls собираются по index', () => {
+test('tool_calls из итогового события', () => {
+  const call = { id: 'call-1', function: { name: 'mcp__knowledge-hub__Search_ITS', arguments: '{"query":"x"}' }, type: 'function' };
   const p = parse(
-    { role: 'assistant', uuid: 'a-1' },
-    { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', function: { name: 'Search_' } }] } }] },
-    { choices: [{ delta: { tool_calls: [{ index: 0, function: { name: 'ITS', arguments: '{"q":' } }] } }] },
-    { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] } }] },
+    { uuid: 'a-1', role: null, content_delta: { content: '', tool_calls: [{ index: 0, ...call }] } },
+    { uuid: 'a-1', role: 'assistant', content: { content: '', tool_calls: [call] }, finished: true },
   );
-  const r = p.result();
-  assert.ok(r.hasToolCalls);
-  assert.equal(r.assistantUuid, 'a-1');
-  assert.deepEqual(r.toolCalls, [{ id: 'call-1', function: { name: 'Search_ITS', arguments: '{"q":"x"}' } }]);
+  assert.ok(p.result().hasToolCalls);
+  assert.deepEqual(p.result().toolCalls, [call]);
 });
 
-test('[DONE] и мусорные строки не ломают парсер', () => {
+test('несколько ответов в одном потоке: итог — последний (сервер сам отклонил неизвестный инструмент)', () => {
+  // Наблюдалось на живом API: вызов «Search_ITS» без префикса, сервер ответил «unknown tool» и продолжил
+  const p = parse(
+    { uuid: 'a-1', role: null, content_delta: { content: '', tool_calls: [{ index: 0, id: 'call-x', function: { name: 'Search_ITS' } }] } },
+    { uuid: 'a-1', role: 'assistant', content: { content: '', tool_calls: null }, finished: true },
+    { uuid: 't-1', role: 'tool', content: { content: "'Search_ITS' is unknown tool." }, finished: true },
+    { uuid: 'a-2', role: 'assistant', content: null, finished: false },
+    { uuid: 'a-2', role: null, content_delta: { content: 'Ответ' } },
+    { uuid: 'a-2', role: 'assistant', content: { content: 'Ответ без поиска' }, finished: true },
+  );
+  const r = p.result();
+  assert.equal(r.text, 'Ответ без поиска');
+  assert.equal(r.hasToolCalls, false);
+  assert.deepEqual(r.toolCalls, []);
+  assert.equal(r.assistantUuid, 'a-2');
+});
+
+test('heartbeat и мусорные строки не ломают парсер', () => {
   const p = new SseParser();
-  p.feedLine('event: message');
+  p.feedLine(': heartbeat 1791277585183');
   p.feedLine('data: не json');
   p.feedLine('data: {"content_delta":"ок"}');
-  p.feedLine('data: [DONE]');
-  p.feedLine('data: {"content_delta":"после конца"}');
   assert.equal(p.result().text, 'ок');
 });
 
 test('только reasoning без текста помечается', () => {
-  const p = parse({ choices: [{ delta: { reasoning_content: 'хм' } }] });
+  const p = parse({ content_delta: { content: '', reasoning_content: 'хм' } });
   assert.ok(p.result().hasOnlyReasoning);
 });
 
 test('thinking-теги вырезаются, незакрытый скрывается при стриминге', () => {
   assert.equal(stripThinkingTags('<think>скрыто</think>Ответ'), 'Ответ');
   assert.equal(stripThinkingTags('Ответ<thinking>пишется...', true), 'Ответ');
-});
-
-test('unwrapToolResult разворачивает вложенные обёртки', () => {
-  const inner = JSON.stringify({ content: [{ type: 'text', text: 'результат' }] });
-  assert.equal(unwrapToolResult(JSON.stringify({ content: inner })), 'результат');
-  assert.equal(unwrapToolResult('обычный текст'), 'обычный текст');
 });

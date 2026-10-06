@@ -150,3 +150,32 @@ test('короткий ответ, оборванный на двоеточии,
   assert.equal(t.ran.length, 1);
   assert.match(sent[1], /не прислал команд/);
 });
+
+test('вызов инструмента текстом («@validate code=…») — напоминание, а не итоговый ответ', async () => {
+  const { client, sent } = scriptedClient(['@validate code="Процедура А()\nКонецПроцедуры"', 'Синтаксис проверен, ошибок нет']);
+  const t = tools();
+  const r = await runAgentLoop({ ...base, client, tools: t.tools, maxSteps: 12 });
+  assert.equal(r.text, 'Синтаксис проверен, ошибок нет');
+  assert.equal(t.ran.length, 0);
+  assert.match(sent[1], /написал его текстом/);
+});
+
+test('looksLikeTextToolCall: вызовы инструментов текстом, но не обычный ответ', async () => {
+  const { looksLikeTextToolCall } = await import('../agent/protocol');
+  for (const t of ['@validate code="x"', "@TodoWrite todos=[{'content': 'a'}]", 'mcp__syntax-checker__validate(code="x")']) assert.ok(looksLikeTextToolCall(t), t);
+  for (const t of ['Готово, файл создан.', '@read_file a.md', 'Используйте @read_file для чтения']) assert.ok(!looksLikeTextToolCall(t), t);
+});
+
+test('вызов проверки синтаксиса текстом: напоминание повторяет код из файла, а не версию модели', async () => {
+  const { client, sent } = scriptedClient([
+    '@edit_file m.bsl\n<<<<<<< SEARCH\nА = 1;\n=======\nА = 2;\n>>>>>>> REPLACE\n@end',
+    '@validate code="Процедура П()\nА = 2;\nКонецПроцедуры"',
+    'Ошибок нет',
+  ]);
+  const fileText = 'Процедура П()\nА = 2;\nКонецПроцедур\n';
+  const tools = { run: async () => 'Правка m.bsl применена.', readFileText: async () => fileText };
+  await runAgentLoop({ ...base, client, tools, maxSteps: 12 });
+  assert.match(sent[2], /написал его текстом/);
+  assert.ok(sent[2].includes('```bsl\nПроцедура П()\nА = 2;\nКонецПроцедур\n'), 'в напоминании — текст из файла');
+  assert.ok(!sent[2].includes('КонецПроцедуры'), 'не версия модели');
+});

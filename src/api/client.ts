@@ -2,7 +2,7 @@
  * HTTP-клиент к API 1С:Напарник (code.1c.ai).
  * Порт OneCApiClient из 1c-ai-mcp, адаптированный под чат: ответ стримится в UI.
  */
-import { SseParser, SseParseResult, ToolCall, stripThinkingTags, unwrapToolResult } from './sseParser';
+import { SseParser, SseParseResult, ToolCall, stripThinkingTags } from './sseParser';
 
 export interface ClientConfig {
   token: string;
@@ -21,8 +21,16 @@ export interface StreamCallbacks {
   unavailableToolHint?: string;
   /** Модель вызвала инструменты, которые мы отклонили (инструменты 1С:EDT) */
   onRejectedTools?: (toolNames: string[]) => void;
-  /** Напоминание модели, если ответ пришёл пустым (например, в агентном режиме — продолжить @-командами) */
-  emptyAnswerHint?: string;
+  /**
+   * Выполнить недоступный инструмент своими силами (ReadSystemFile → чтение файла проекта).
+   * Возвращает текст для модели или undefined — тогда вызов отклоняется с unavailableToolHint
+   */
+  emulateTool?: (call: ToolCall) => Promise<string | undefined>;
+  /**
+   * Просьба продолжить: ответ пришёл пустым или модель зациклилась на бесполезных инструментах
+   * (план TodoWrite, отклонённые инструменты 1С:EDT). В агентном режиме — продолжить @-командами
+   */
+  continueHint?: string;
 }
 
 // Инструменты сервиса, которые работают без 1С:EDT. Остальные (WriteSystemFile, GetObject_in_Project…)
@@ -37,7 +45,7 @@ export function isUsableServerTool(name: string | undefined): boolean {
 }
 
 const DEFAULT_UNAVAILABLE_HINT = 'Инструмент недоступен: работа идёт не из 1С:EDT, сессии проекта нет. Ответь без него.';
-const DEFAULT_EMPTY_ANSWER_HINT = 'Твой ответ пришёл пустым. Ответь, пожалуйста, на мой предыдущий вопрос текстом.';
+const DEFAULT_CONTINUE_HINT = 'Не вызывай больше инструменты — ответь, пожалуйста, на мой предыдущий вопрос текстом.';
 
 export interface ChatAnswer {
   text: string;
@@ -45,7 +53,13 @@ export interface ChatAnswer {
   assistantUuid?: string;
 }
 
-const MAX_TOOL_ROUNDS = 10;
+// Жёсткий предел на случай, если зацикливание не распознано; обычно хватает 1–8 раундов поиска
+const MAX_TOOL_ROUNDS = 25;
+// Столько раундов подряд без пользы (только TodoWrite или отклонённые вызовы) — модель зациклилась.
+// Наблюдалось на живом API: TodoWrite 11 раз подряд (сервер отвечает «continue to use the todo list»),
+// Task — 10 отказов подряд. Тогда вместо ответа инструменту пишем от пользователя «продолжай»
+const MAX_IDLE_TOOL_ROUNDS = 3;
+const MAX_CONTINUE_REQUESTS = 2;
 
 // package.json лежит на два уровня выше out/api/ — и в .vsix, и при запуске тестов
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -138,12 +152,27 @@ export class NaparnikClient {
       role: 'user',
       content: { content: { instruction: message } },
     };
-    let hadToolCalls = false;
-    let emptyRetried = false;
+    let continueRequests = 0;
+    let idleRounds = 0;
+    const seenCalls = new Set<string>();
     // Последний ответ ассистента в этом обмене — от него можно продолжить, не теряя вопрос пользователя
     let lastAssistantUuid: string | undefined;
+    const hint = callbacks.continueHint ?? DEFAULT_CONTINUE_HINT;
+    // Сначала просим продолжить в той же ветке: сервер принимает сообщение пользователя и в ответ на неотвеченные
+    // tool_calls, контекст сохраняется (проверено). Не помогло — задаём вопрос заново от прежнего ответа:
+    // зацикленная ветка («continue to use the todo list» по кругу) выпадает из контекста модели
+    const askToContinue = (parent: string | undefined): boolean => {
+      if (continueRequests >= MAX_CONTINUE_REQUESTS || (continueRequests === 0 && !parent)) return false;
+      payload =
+        continueRequests === 0
+          ? { parent_uuid: parent, role: 'user', content: { content: { instruction: hint } } }
+          : { parent_uuid: parentUuid ?? null, role: 'user', content: { content: { instruction: `${message}\n\n${hint}` } } };
+      continueRequests++;
+      idleRounds = 0;
+      return true;
+    };
 
-    for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+    for (let round = 0; round <= MAX_TOOL_ROUNDS + MAX_CONTINUE_REQUESTS; round++) {
       const result = await this.streamRequest(conversationId, payload, callbacks, signal);
       // Вызовы без id сервер создаёт, когда принимает текст модели за вызов инструмента
       // (например, XML-теги в ответе). Подтвердить их нельзя — считаем ответ обычным текстом.
@@ -153,29 +182,16 @@ export class NaparnikClient {
         if (result.hasOnlyReasoning) {
           throw new Error('API вернул только рассуждения без итогового ответа');
         }
-        let text = stripThinkingTags(result.text);
-        if (hadToolCalls) {
-          text = unwrapToolResult(text);
+        const text = stripThinkingTags(result.text);
+        if (text) {
+          return { text, assistantUuid: result.assistantUuid };
         }
-        if (!text) {
-          // Сервер изредка присылает пустой ответ (наблюдалось после отклонённых инструментов 1С:EDT).
-          // Один раз просим продолжить, а не роняем весь запрос
-          const continueFrom = result.assistantUuid ?? lastAssistantUuid;
-          if (!emptyRetried && continueFrom) {
-            emptyRetried = true;
-            payload = {
-              parent_uuid: continueFrom,
-              role: 'user',
-              content: { content: { instruction: callbacks.emptyAnswerHint ?? DEFAULT_EMPTY_ANSWER_HINT } },
-            };
-            continue;
-          }
-          throw new Error('API не вернул текстовый ответ');
-        }
-        return { text, assistantUuid: result.assistantUuid };
+        // Сервер изредка присылает пустой ответ (наблюдалось после отклонённых инструментов 1С:EDT).
+        // Просим продолжить, а не роняем весь запрос
+        if (askToContinue(result.assistantUuid ?? lastAssistantUuid)) continue;
+        throw new Error('API не вернул текстовый ответ');
       }
 
-      hadToolCalls = true;
       if (!result.assistantUuid) {
         throw new Error('API вернул tool_calls без идентификатора сообщения');
       }
@@ -184,19 +200,43 @@ export class NaparnikClient {
       if (usable.length > 0) {
         callbacks.onToolCalls?.(usable.map(toolName));
       }
-      const rejected = accepted.filter((tc) => !isUsableServerTool(tc.function?.name));
+      // Недоступные инструменты: часть выполняем сами (ответ — их результат), остальные отклоняем
+      const emulated = new Map<ToolCall, string>();
+      const rejected: ToolCall[] = [];
+      for (const tc of accepted.filter((c) => !isUsableServerTool(c.function?.name))) {
+        const reply = await callbacks.emulateTool?.(tc);
+        if (reply === undefined) rejected.push(tc);
+        else emulated.set(tc, reply);
+      }
       if (rejected.length > 0) {
         callbacks.onRejectedTools?.(rejected.map(toolName));
+      }
+
+      // Полезен новый вызов поиска или выполненного нами инструмента; план и повтор того же вызова — нет
+      // (наблюдалось: TodoWrite и чтение тех же двух файлов по кругу)
+      let useful = false;
+      for (const tc of [...usable, ...emulated.keys()]) {
+        const key = `${tc.function?.name}\n${tc.function?.arguments ?? ''}`;
+        if (USABLE_SERVER_TOOL_NAMES.has(tc.function?.name ?? '') || seenCalls.has(key)) continue;
+        seenCalls.add(key);
+        useful = true;
+      }
+      idleRounds = useful ? 0 : idleRounds + 1;
+      // Зациклилась или исчерпала раунды — просим продолжить без инструментов
+      if ((idleRounds >= MAX_IDLE_TOOL_ROUNDS || round >= MAX_TOOL_ROUNDS - 1) && askToContinue(result.assistantUuid)) {
+        continue;
       }
 
       payload = {
         parent_uuid: result.assistantUuid,
         role: 'tool',
-        // accepted — сервер выполнит сам (content обязан быть пустым), rejected — с пояснением для модели
+        // accepted — сервер выполнит сам (content обязан быть пустым); rejected — с нашим результатом или пояснением
         content: accepted.map((tc) =>
-          isUsableServerTool(tc.function?.name)
-            ? { tool_call_id: tc.id, status: 'accepted', content: null }
-            : { tool_call_id: tc.id, status: 'rejected', content: callbacks.unavailableToolHint ?? DEFAULT_UNAVAILABLE_HINT },
+          emulated.has(tc)
+            ? { tool_call_id: tc.id, status: 'rejected', content: emulated.get(tc) }
+            : rejected.includes(tc)
+              ? { tool_call_id: tc.id, status: 'rejected', content: callbacks.unavailableToolHint ?? DEFAULT_UNAVAILABLE_HINT }
+              : { tool_call_id: tc.id, status: 'accepted', content: null },
         ),
       };
     }
@@ -242,11 +282,9 @@ export class NaparnikClient {
         parser.feedLine(line.replace(/\r$/, ''));
       }
       callbacks.onText(parser.visibleText);
-      if (parser.done) {
-        break;
-      }
     }
-    if (!parser.done && buffer) {
+    // Поток читаем до конца: после завершённого ответа сервер может продолжить следующим
+    if (buffer) {
       parser.feedLine(buffer);
     }
     return parser.result();

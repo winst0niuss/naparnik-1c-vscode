@@ -1,16 +1,10 @@
 import * as vscode from 'vscode';
 import { createHash } from 'node:crypto';
-import { NaparnikClient } from './api/client';
+import { ApiError, NaparnikClient } from './api/client';
 import { TokenStore } from './tokenStore';
 import { ChatHistory, SavedChat, createChat, makeTitle } from './chatHistory';
 import { AgentCommand, MAX_AGENT_STEPS, buildAgentPrompt, findUnfinishedWrite, stripCommandsForDisplay } from './agent/protocol';
 import { runAgentLoop } from './agent/agentLoop';
-
-/** /init выполнен, только если NAPARNIK.md создан или изменён */
-function initDone(executed: AgentCommand[]): string | undefined {
-  const written = executed.some((c) => (c.kind === 'create_file' || c.kind === 'edit_file') && /(^|\/)NAPARNIK\.md$/i.test(c.path));
-  return written ? undefined : 'Задача не выполнена: NAPARNIK.md ещё не создан. Если информации достаточно — создай его командой @create_file NAPARNIK.md … @end; если нет — дочитай нужное командами.';
-}
 import { INIT_PROMPT, MAKE_RULES_PROMPT, RULES_DIR, SLASH_COMMANDS, helpText, parseSlash } from './slashCommands';
 import { WorkspaceTools } from './agent/workspaceTools';
 import { EditPreview, PendingEdit } from './agent/editPreview';
@@ -31,6 +25,12 @@ import {
 } from './agent/importSources';
 import { findMentions, formatMentionedFiles, rankPaths, resolveMention } from './agent/mentions';
 
+/** /init выполнен, только если NAPARNIK.md создан или изменён */
+function initDone(executed: AgentCommand[]): string | undefined {
+  const written = executed.some((c) => (c.kind === 'create_file' || c.kind === 'edit_file') && /(^|\/)NAPARNIK\.md$/i.test(c.path));
+  return written ? undefined : 'Задача не выполнена: NAPARNIK.md ещё не создан. Если информации достаточно — создай его командой @create_file NAPARNIK.md … @end; если нет — дочитай нужное командами.';
+}
+
 const PROJECT_ACCESS_KEY = 'naparnik.projectAccess';
 // Лимит шагов для /init и /make-rules: им нужно изучить проект, обычному вопросу — нет
 const EXPLORE_MAX_STEPS = 25;
@@ -47,8 +47,6 @@ type WebviewMessage =
   | { type: 'ready' }
   | { type: 'send'; text: string }
   | { type: 'stop' }
-  | { type: 'newChat' }
-  | { type: 'showHistory' }
   | { type: 'setToken' }
   | { type: 'toggleProject' }
   | { type: 'resolveEdit'; id: number; accepted: boolean }
@@ -491,12 +489,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'stop':
         this.running.get(this.chat.id)?.abort.abort();
         break;
-      case 'newChat':
-        this.newChat();
-        break;
-      case 'showHistory':
-        await this.showHistory();
-        break;
       case 'setToken':
         await vscode.commands.executeCommand('naparnik.setToken');
         break;
@@ -561,6 +553,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     // Запоминаем чат: пользователь может переключиться, а ответ должен попасть сюда
     const chat = this.chat;
+    // Состояние дискуссии до запроса: после ошибки или «Стоп» продолжаем от последнего полного ответа
+    const before = { lastAssistantUuid: chat.lastAssistantUuid, agentPrimed: chat.agentPrimed, agentPaused: chat.agentPaused, lastEditorContext: chat.lastEditorContext };
     if (chat.entries.length === 0) {
       chat.title = makeTitle(text);
     }
@@ -655,12 +649,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const message = run.abort.signal.aborted ? 'Остановлено' : errorMessage(err);
       chat.entries.push({ role: 'error', text: message });
       postIfVisible({ type: 'error', message });
-      // После сбоя начинаем новую дискуссию: старая могла остаться в неконсистентном состоянии
-      chat.conversationId = undefined;
-      chat.lastAssistantUuid = undefined;
-      chat.agentPrimed = false;
-      chat.agentPaused = false;
-      chat.lastEditorContext = undefined; // новая дискуссия на сервере файла ещё не видела
+      // Дискуссию не сбрасываем: следующий вопрос уйдёт от последнего полного ответа, и модель помнит чат
+      // (проверено на живом API — после прерванного ответа и прерванного поиска контекст сохраняется).
+      // Неудачная ветка модели не видна, поэтому возвращаем всё, что она могла бы «знать», к состоянию до запроса
+      Object.assign(chat, before);
+      // Сервер отверг запрос к дискуссии (не токен и не лимит частоты) — она могла испортиться, начинаем новую
+      if (err instanceof ApiError && err.status >= 400 && err.status < 500 && ![401, 403, 429].includes(err.status)) {
+        Object.assign(chat, { conversationId: undefined, lastAssistantUuid: undefined, agentPrimed: false, agentPaused: false, lastEditorContext: undefined });
+      }
       return false;
     } finally {
       this.running.delete(chat.id);

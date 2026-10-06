@@ -226,11 +226,7 @@
           else addError(entry.text);
         }
         closeStepGroups();
-        break;
-      case 'clear':
-        stopStatus();
-        messagesEl.innerHTML = '';
-        setBusy(false);
+        scrollToBottom(true);
         break;
       case 'editorContext':
         // Чип: какой файл (и выделение) уйдёт со следующим сообщением; клик — выключить/включить
@@ -335,6 +331,7 @@
         break;
       case 'userMessage':
         addUser(msg.text, msg.context);
+        scrollToBottom(true);
         break;
       case 'assistantStart':
         setBusy(true);
@@ -526,8 +523,15 @@
     addMessage('error').textContent = text;
   }
 
-  function scrollToBottom() {
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+  // Прокрутка за ответом — только пока пользователь внизу: прокрутил выше, чтобы читать, — не дёргаем
+  let stickToBottom = true;
+  messagesEl.addEventListener('scroll', () => {
+    stickToBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
+  });
+
+  function scrollToBottom(force) {
+    if (force) stickToBottom = true;
+    if (stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
   function flash(btn, text) {

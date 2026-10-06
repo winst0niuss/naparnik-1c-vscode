@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { MAX_MENTION_FILE_CHARS, MAX_MENTION_TOTAL_CHARS, findMentions, formatMentionedFiles, mentionToken, rankPaths, resolveMention } from '../agent/mentions';
+import { MAX_MENTION_FILE_CHARS, MAX_MENTION_TOTAL_CHARS, findMentions, formatMentionedFiles, rankPaths, resolveMention } from '../agent/mentions';
 
 const PATHS = [
   'README.md',
@@ -44,9 +44,4 @@ test('formatMentionedFiles: язык по расширению, обрезка �
   assert.ok(r.skipped.length > 0);
   assert.ok(r.text.includes('Не приложены из-за объёма'));
   assert.deepEqual(formatMentionedFiles([]), { text: '', skipped: [] });
-});
-
-test('mentionToken: путь с пробелом — в кавычках', () => {
-  assert.equal(mentionToken('docs/Мой файл.md'), '@"docs/Мой файл.md"');
-  assert.equal(mentionToken('README.md'), '@README.md');
 });

@@ -60,9 +60,10 @@ function renderContext(ctx: ProjectContext): string {
 export const AGENT_UNAVAILABLE_TOOL_HINT =
   'Этот инструмент недоступен: работа идёт не из 1С:EDT. Для файлов проекта используй команды @list_dir, @read_file, @search, @edit_file, @create_file — ответь ими.';
 
-/** Ответ модели пришёл пустым — в агентном режиме напоминаем, как продолжить */
-export const AGENT_EMPTY_ANSWER_HINT =
-  'Твой ответ пришёл пустым. Продолжи задачу: для файлов проекта используй команды @list_dir, @read_file, @search, @edit_file, @create_file (инструменты 1С:EDT недоступны), или дай итоговый ответ текстом.';
+/** Ответ пустой или модель зациклилась на инструментах (план TodoWrite, субагенты Task) — как продолжить */
+export const AGENT_CONTINUE_HINT =
+  'Не вызывай больше инструменты: план (TodoWrite) не нужен, субагентов (Task) и инструментов 1С:EDT здесь нет. ' +
+  'Продолжи задачу сам командами @list_dir, @read_file, @search, @edit_file, @create_file — несколько в одном ответе — или дай итоговый ответ текстом.';
 
 /** Инструкция для модели. Отправляется первым сообщением чата с включённым доступом к проекту */
 export function buildAgentPrompt(
@@ -408,8 +409,12 @@ function locateFragment(lines: string[], full: string, fragment: string): [numbe
 /** Просьба к модели проверить изменённый код серверным инструментом проверки синтаксиса */
 export function syntaxCheckRequest(path: string, code: string): string {
   return (
-    `Проверь синтаксис изменённого кода ${path}: вызови инструмент mcp__syntax-checker__validate, параметр code — текст ниже (изменённые процедуры целиком). ` +
-    'Если найдены ошибки — исправь их через @edit_file. Если ошибок нет — продолжай задачу, в итоговом ответе коротко укажи результат проверки.\n' +
+    // «Как поиск по ИТС» и запрет «@validate»: без этого модель в половине ответов писала вызов текстом «@validate code=…»
+    `Проверь синтаксис изменённого кода ${path} своим инструментом mcp__syntax-checker__validate — вызови его так же, как поиск по ИТС ` +
+    '(это не @-команда, текстом «@validate» не пиши), параметр code — текст ниже ровно как есть, ничего в нём не исправляя: это то, что сейчас в файле. ' +
+    // Иначе модель проверяла исправленный «в уме» вариант и отчитывалась об успехе, не применив правку
+    'Если найдены ошибки — исправь их в файле через @edit_file, я пришлю новый код на проверку; свой исправленный вариант до правки не проверяй. ' +
+    'Если ошибок нет — продолжай задачу, в итоговом ответе коротко укажи результат проверки.\n' +
     '```bsl\n' + code + '\n```'
   );
 }
@@ -448,6 +453,40 @@ function stripFence(body: string): string {
 export function looksLikeMalformedEdit(text: string): boolean {
   return /<{5,9} SEARCH/.test(text) && />{5,9} REPLACE/.test(text) && parseCommands(text).length === 0;
 }
+
+/**
+ * Инструменты 1С:EDT, которые можно выполнить самим: ReadSystemFile — как @read_file, WriteSystemFile — как
+ * @create_file (с подтверждением; существующий файл не перезаписывается). Модель упорно зовёт их
+ * (на живом API — 12 раз подряд после отказов), в том числе с путями «attachment://README.md».
+ * Остальные инструменты EDT (поиск по проекту EDT, субагенты Task) — нет
+ */
+export function emulatedCommand(call: { function?: { name?: string; arguments?: string } }): AgentCommand | undefined {
+  const name = call.function?.name;
+  if (name !== 'ReadSystemFile' && name !== 'WriteSystemFile') return undefined;
+  let args: { path?: unknown; file_path?: unknown; content?: unknown };
+  try {
+    args = JSON.parse(call.function?.arguments ?? '');
+  } catch {
+    return undefined;
+  }
+  const raw = args.path ?? args.file_path;
+  const path = typeof raw === 'string' ? raw.replace(/^[a-z]+:\/\//i, '').trim() : '';
+  // Путь-UUID — идентификатор вложения сервера, а не файл проекта
+  if (!path || /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(path)) return undefined;
+  if (name === 'ReadSystemFile') return { kind: 'read_file', path };
+  return typeof args.content === 'string' ? { kind: 'create_file', path, content: args.content } : undefined;
+}
+
+/**
+ * Модель написала вызов инструмента текстом: «@validate code=…», «@TodoWrite todos=…», «mcp__syntax-checker__validate(…)».
+ * Ответ без команд, который начинается с «@имя», — не наша команда (наши уже разобраны)
+ */
+export function looksLikeTextToolCall(text: string): boolean {
+  return /^\s*(@[a-z_][\w-]*|mcp__[\w-]+)/i.test(text) && parseCommands(text).length === 0;
+}
+
+export const TEXT_TOOL_CALL_HINT =
+  'Вызов инструмента не выполнен: ты написал его текстом. Инструменты (mcp__syntax-checker__validate, поиск по ИТС) вызывай как инструменты, а не текстом в ответе; @-команды — только @list_dir, @read_file, @search, @edit_file, @create_file, @move_file, @copy_file, @delete_file.';
 
 export const MALFORMED_EDIT_HINT =
   'Правка не выполнена: блоки SEARCH/REPLACE должны быть внутри команды — строка «@edit_file путь», затем блоки, затем «@end». Повтори правку в этом формате.';

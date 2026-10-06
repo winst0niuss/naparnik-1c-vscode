@@ -10,14 +10,8 @@ export function parseGitignore(text: string): RegExp[] {
     const anchored = line.startsWith('/') || line.slice(0, -1).includes('/');
     line = line.replace(/^\/+|\/+$/g, '');
     if (!line) continue;
-    const body = line
-      .split('')
-      .map((ch) => (ch === '*' ? '\u0000' : ch === '?' ? '[^/]' : ch.replace(/[.+^${}()|[\]\\]/g, '\\$&')))
-      .join('')
-      .replace(/\u0000\u0000/g, '.*')
-      .replace(/\u0000/g, '[^/]*');
     // Совпадение с путём или с любой папкой выше него
-    patterns.push(new RegExp(anchored ? `^${body}(/|$)` : `(^|/)${body}(/|$)`));
+    patterns.push(new RegExp(anchored ? `^${patternBody(line)}(/|$)` : `(^|/)${patternBody(line)}(/|$)`));
   }
   return patterns;
 }
@@ -28,12 +22,16 @@ export function parseGitignore(text: string): RegExp[] {
  */
 export function globToRegExp(glob: string): RegExp {
   const g = glob.trim().replace(/^\.?\/+/, '');
-  const body = g
+  return new RegExp(g.includes('/') ? `^${patternBody(g)}$` : `(^|/)${patternBody(g)}$`);
+}
+
+/** Шаблон с * ** ? → тело регулярного выражения; «**\/» — любое число папок, в том числе ни одной */
+function patternBody(pattern: string): string {
+  return pattern
     .split('')
     .map((ch) => (ch === '*' ? '\u0000' : ch === '?' ? '[^/]' : ch.replace(/[.+^${}()|[\]\\]/g, '\\$&')))
     .join('')
     .replace(/\u0000\u0000\//g, '(.*/)?')
     .replace(/\u0000\u0000/g, '.*')
     .replace(/\u0000/g, '[^/]*');
-  return new RegExp(g.includes('/') ? `^${body}$` : `(^|/)${body}$`);
 }

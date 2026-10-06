@@ -86,5 +86,3 @@ function activeDiffUri(): vscode.Uri | undefined {
   const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
   return input instanceof vscode.TabInputTextDiff ? input.modified : undefined;
 }
-
-export function deactivate(): void {}

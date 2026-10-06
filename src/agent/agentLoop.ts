@@ -4,14 +4,17 @@
  */
 import { ChatAnswer, StreamCallbacks } from '../api/client';
 import {
-  AGENT_EMPTY_ANSWER_HINT,
+  AGENT_CONTINUE_HINT,
   AGENT_UNAVAILABLE_TOOL_HINT,
   AgentCommand,
   MALFORMED_EDIT_HINT,
+  TEXT_TOOL_CALL_HINT,
   changedCode,
   describeCommand,
+  emulatedCommand,
   isBslPath,
   looksLikeMalformedEdit,
+  looksLikeTextToolCall,
   parseCommands,
   syntaxCheckRequest,
 } from './protocol';
@@ -102,6 +105,9 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   let formatReminded = false;
   let finishing = false; // FINISH_HINT уже отправлен
   let nudges = 0; // напоминаний «продолжай командами»
+  // Последняя просьба проверить синтаксис — с текстом из файла. Повторяется, если модель написала вызов текстом:
+  // иначе она передаёт в инструмент свою версию кода из того текста, а не то, что лежит в файле
+  let syntaxRequest = '';
   const executed: AgentCommand[] = [];
 
   for (let step = 0; ; step++) {
@@ -114,7 +120,17 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         onToolCalls: opts.onToolCalls,
         onRejectedTools: opts.onRejectedTools,
         unavailableToolHint: tools ? AGENT_UNAVAILABLE_TOOL_HINT : undefined,
-        emptyAnswerHint: tools ? AGENT_EMPTY_ANSWER_HINT : undefined,
+        continueHint: tools ? AGENT_CONTINUE_HINT : undefined,
+        emulateTool: tools
+          ? async (call) => {
+              const cmd = emulatedCommand(call);
+              if (!cmd) return undefined;
+              const description = describeCommand(cmd);
+              opts.onStep?.(description);
+              executed.push(cmd);
+              return `${call.function?.name} здесь не работает — расширение выполнило его как @${cmd.kind}. Дальше используй @-команды.\n\n${await tools.run(cmd)}`;
+            }
+          : undefined,
       },
       signal,
     );
@@ -130,8 +146,12 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     }
     if (commands.length === 0) {
       // Ответ без команд, но задача явно не доделана — до двух напоминаний, если шаги ещё есть
-      const notDone = opts.checkDone?.(executed, answer.text) ?? (tools && looksLikeUnfinishedIntent(answer.text) ? CONTINUE_HINT : undefined);
-      if (tools && notDone && nudges < 2 && !finishing && step < maxSteps) {
+      const notDone = !tools
+        ? undefined
+        : looksLikeTextToolCall(answer.text)
+          ? TEXT_TOOL_CALL_HINT + (syntaxRequest ? `\n\n${syntaxRequest}` : '')
+          : opts.checkDone?.(executed, answer.text) ?? (looksLikeUnfinishedIntent(answer.text) ? CONTINUE_HINT : undefined);
+      if (notDone && nudges < 2 && !finishing && step < maxSteps) {
         nudges++;
         opts.onNextRound?.();
         message = notDone;
@@ -167,11 +187,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     opts.onNextRound?.();
     message = `Результаты команд:\n\n${results.join('\n\n')}`;
     // Применённую правку модуля 1С модель проверяет серверным инструментом проверки синтаксиса
+    const requests: string[] = [];
     for (const [path, fragments] of checks) {
       const text = await tools!.readFileText?.(path).catch(() => undefined);
       const code = text === undefined ? undefined : changedCode(text, fragments);
-      if (code) message += `\n\n${syntaxCheckRequest(path, code)}`;
+      if (code) requests.push(syntaxCheckRequest(path, code));
     }
+    syntaxRequest = requests.join('\n\n');
+    if (syntaxRequest) message += `\n\n${syntaxRequest}`;
 
     if (finishing) {
       // Правки по FINISH_HINT выполнены — дальше только итоговый ответ

@@ -43,3 +43,10 @@ test('маска поиска', async () => {
     for (const p of no) assert.ok(!re.test(p), `${glob} !~ ${p}`);
   }
 });
+
+test('«**/имя» в .gitignore скрывает и папку в корне', () => {
+  const [re] = parseGitignore('**/node_modules');
+  assert.ok(re.test('node_modules'));
+  assert.ok(re.test('pkg/node_modules/x.js'));
+  assert.ok(!re.test('src/node_modules_old'));
+});

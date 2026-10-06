@@ -135,7 +135,7 @@ export class WorkspaceTools {
    * Файлы проекта для поиска. Обходим папки сами, не заходя в игнорируемые: иначе большая папка
    * из .gitignore (зависимости, сборка) съела бы лимит файлов раньше, чем дойдёт очередь до кода.
    */
-  private async collectFiles(match: RegExp | undefined, limit: number): Promise<vscode.Uri[]> {
+  private async collectFiles(match: { test(rel: string): boolean } | undefined, limit: number): Promise<vscode.Uri[]> {
     const files: vscode.Uri[] = [];
     const queue: vscode.Uri[] = [this.root];
     while (queue.length > 0 && files.length < limit) {
@@ -187,6 +187,16 @@ export class WorkspaceTools {
       rulesTotal += part.length;
     }
     return { docs, attached, rules };
+  }
+
+  /** Файлы проекта (кроме игнорируемых git), подходящие под условие, — пути от корня. Для /import */
+  async findFiles(match: (rel: string) => boolean, limit = MAX_SEARCH_FILES): Promise<string[]> {
+    return (await this.collectFiles({ test: match }, limit)).map((uri) => this.relative(uri));
+  }
+
+  /** Текст файла проекта по пути от корня (открытый — из редактора) */
+  async readProjectText(relPath: string): Promise<string> {
+    return this.readText(await this.resolve(relPath));
   }
 
   /** Список файлов правил .rules/*.md (для /rules) */

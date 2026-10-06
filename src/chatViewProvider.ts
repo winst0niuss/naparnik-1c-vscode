@@ -16,11 +16,25 @@ import { WorkspaceTools } from './agent/workspaceTools';
 import { EditPreview, PendingEdit } from './agent/editPreview';
 import { EditorContextTracker } from './editorContextTracker';
 import { contextLabel, formatEditorContext } from './agent/editorContext';
+import {
+  FoundFile,
+  IMPORT_SOURCES,
+  ImportState,
+  buildImportPrompt,
+  classifyProjectFile,
+  makeFoundFile,
+  parseImportArgs,
+  readUserFiles,
+  scanReport,
+  selectForImport,
+} from './agent/importSources';
 
 const PROJECT_ACCESS_KEY = 'naparnik.projectAccess';
 // Лимит шагов для /init и /make-rules: им нужно изучить проект, обычному вопросу — нет
 const EXPLORE_MAX_STEPS = 25;
 const PROJECT_CONSENT_KEY = 'naparnik.projectAccessConsent';
+// Хеши файлов, перенесённых /import, — отдельно для каждого проекта
+const IMPORT_STATE_KEY = 'naparnik.importState';
 
 /** Сообщения из webview в расширение */
 type WebviewMessage =
@@ -295,6 +309,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'rules':
         await this.showRules();
         break;
+      case 'import':
+        await this.importRules(slash.args);
+        break;
       default:
         this.info(`Нет команды \`/${slash.name}\`. Список команд — \`/help\`.`);
     }
@@ -315,6 +332,81 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return false;
     }
     return true;
+  }
+
+  /** Инструкции других ИИ-инструментов: проектные (без игнорируемых git) и пользовательские из домашней папки */
+  private async scanImportSources(tools: WorkspaceTools): Promise<FoundFile[]> {
+    const found: FoundFile[] = [];
+    for (const rel of await tools.findFiles((p) => classifyProjectFile(p) !== undefined)) {
+      const kind = classifyProjectFile(rel)!;
+      const text = await tools.readProjectText(rel).catch(() => '');
+      if (text.trim()) found.push(makeFoundFile(kind.source, rel, text, false, kind.settings));
+    }
+    return [...found, ...(await readUserFiles())];
+  }
+
+  /** /import — без аргументов только показывает найденное; с аргументами переносит выбранное в .rules */
+  private async importRules(args: string): Promise<void> {
+    const { sources, unknown } = parseImportArgs(args);
+    if (unknown.length > 0) {
+      this.info(`Неизвестные источники: ${unknown.map((u) => `\`${u}\``).join(', ')}. Доступны: ${IMPORT_SOURCES.map((s) => `\`${s.id}\``).join(', ')}, \`all\`.`);
+      return;
+    }
+    // Проверяем до сканирования и вопроса о согласии: иначе send откажет уже после них
+    if (sources.length > 0 && this.running.has(this.chat.id)) {
+      this.info('Напарник ещё отвечает в этом чате. Дождитесь ответа или остановите его — `/stop`.');
+      return;
+    }
+    // Сканирование только читает файлы локально, доступ к проекту для него не нужен
+    const scanner = WorkspaceTools.forCurrentWorkspace(this.preview.confirm);
+    if (!scanner) {
+      this.info('Откройте папку проекта, чтобы перенести инструкции ИИ-инструментов.');
+      return;
+    }
+    const state = this.workspaceState.get<ImportState>(IMPORT_STATE_KEY, {});
+    const all = await this.scanImportSources(scanner);
+    if (sources.length === 0) {
+      this.info(scanReport(all, state));
+      return;
+    }
+
+    let found = all.filter((f) => sources.includes(f.source));
+    const userFiles = found.filter((f) => f.user && selectForImport([f], state).files.length > 0);
+    if (userFiles.length > 0) {
+      const answer = await vscode.window.showWarningMessage(
+        'Перенести также пользовательские инструкции?',
+        {
+          modal: true,
+          detail:
+            `Найдены общие инструкции из домашней папки: ${userFiles.map((f) => f.path).join(', ')}. ` +
+            'Их содержимое будет отправлено в сервис 1С:Напарник (code.1c.ai) и перенесено в правила этого проекта.',
+        },
+        'Перенести',
+        'Только проект',
+      );
+      if (answer === undefined) return;
+      if (answer !== 'Перенести') found = found.filter((f) => !f.user);
+    }
+
+    const selection = selectForImport(found, state);
+    if (selection.files.length === 0) {
+      const names = sources.map((id) => IMPORT_SOURCES.find((s) => s.id === id)!.title).join(', ');
+      this.info(
+        selection.unchanged.length > 0 || selection.tooLarge.length > 0
+          ? `Нового для переноса нет (${names}): ${[...selection.unchanged.map((f) => `\`${f.path}\` уже перенесён`), ...selection.tooLarge.map((f) => `\`${f.path}\` слишком большой`)].join(', ')}.`
+          : `Инструкций не найдено: ${names}. Что есть в проекте — \`/import\`.`,
+      );
+      return;
+    }
+    if (!(await this.ensureProjectAccess('/import'))) return;
+
+    const done = await this.send(`/import ${sources.join(' ')}`, buildImportPrompt(selection), false, EXPLORE_MAX_STEPS);
+    if (done) {
+      // Запоминаем переданные файлы: повторный /import возьмёт только новое и изменившееся
+      const next = { ...this.workspaceState.get<ImportState>(IMPORT_STATE_KEY, {}) };
+      for (const f of selection.files) next[f.path] = f.hash;
+      await this.workspaceState.update(IMPORT_STATE_KEY, next);
+    }
   }
 
   private async closeView(): Promise<void> {
@@ -418,11 +510,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /**
    * Отправить вопрос. text — то, что видит пользователь в чате и истории;
-   * modelText — что уходит модели (для /init и /make-rules это развёрнутая инструкция).
-   */
-  /**
+   * modelText — что уходит модели (для /init, /make-rules и /import это развёрнутая инструкция).
    * withEditorContext: true — приложить открытый файл, если пользователь не выключил чип;
    * 'force' — приложить в любом случае (пользователь явно спросил о выделенном).
+   * Возвращает true, если модель ответила без ошибок и остановки.
    */
   private async send(
     text: string,
@@ -430,21 +521,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     withEditorContext: boolean | 'force' = false,
     maxSteps = MAX_AGENT_STEPS,
     checkDone?: (executed: AgentCommand[]) => string | undefined,
-  ): Promise<void> {
+  ): Promise<boolean> {
     text = text.trim();
     // В одном чате — один запрос за раз; в других чатах можно спрашивать параллельно
     if (!text) {
-      return;
+      return false;
     }
     if (this.running.has(this.chat.id)) {
       this.info('Напарник ещё отвечает в этом чате. Дождитесь ответа или остановите его — `/stop`.');
-      return;
+      return false;
     }
 
     const token = await this.tokens.get();
     if (!token) {
       this.post({ type: 'tokenState', hasToken: false });
-      return;
+      return false;
     }
 
     // Снимок редактора берём сразу: пока ждём ответа, пользователь может переключить файл
@@ -537,6 +628,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       chat.entries.push({ role: 'assistant', text: answer.text });
       postIfVisible({ type: 'assistantDone', text: answer.text });
       this.notifyIfHidden(chat);
+      return true;
     } catch (err) {
       const message = run.abort.signal.aborted ? 'Остановлено' : errorMessage(err);
       chat.entries.push({ role: 'error', text: message });
@@ -547,6 +639,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       chat.agentPrimed = false;
       chat.agentPaused = false;
       chat.lastEditorContext = undefined; // новая дискуссия на сервере файла ещё не видела
+      return false;
     } finally {
       this.running.delete(chat.id);
       // Удалённый во время ответа чат обратно в историю не возвращаем

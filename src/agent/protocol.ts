@@ -9,7 +9,10 @@ export type AgentCommand =
   | { kind: 'read_file'; path: string }
   | { kind: 'search'; query: string; glob?: string }
   | { kind: 'edit_file'; path: string; edits: SearchReplace[] }
-  | { kind: 'create_file'; path: string; content: string };
+  | { kind: 'create_file'; path: string; content: string }
+  | { kind: 'move_file'; from: string; to: string }
+  | { kind: 'copy_file'; from: string; to: string }
+  | { kind: 'delete_file'; path: string };
 
 export interface SearchReplace {
   search: string;
@@ -57,6 +60,10 @@ function renderContext(ctx: ProjectContext): string {
 export const AGENT_UNAVAILABLE_TOOL_HINT =
   'Этот инструмент недоступен: работа идёт не из 1С:EDT. Для файлов проекта используй команды @list_dir, @read_file, @search, @edit_file, @create_file — ответь ими.';
 
+/** Ответ модели пришёл пустым — в агентном режиме напоминаем, как продолжить */
+export const AGENT_EMPTY_ANSWER_HINT =
+  'Твой ответ пришёл пустым. Продолжи задачу: для файлов проекта используй команды @list_dir, @read_file, @search, @edit_file, @create_file (инструменты 1С:EDT недоступны), или дай итоговый ответ текстом.';
+
 /** Инструкция для модели. Отправляется первым сообщением чата с включённым доступом к проекту */
 export function buildAgentPrompt(
   projectTree: { text: string; complete: boolean },
@@ -88,6 +95,11 @@ export function buildAgentPrompt(
 полный текст нового файла
 @end
 
+@move_file ОТКУДА | КУДА — перенести или переименовать файл или папку: в старом месте не останется
+@copy_file ОТКУДА | КУДА — копия, исходный файл остаётся
+@delete_file ПУТЬ — удалить файл или папку (в корзину)
+КУДА — новый путь или существующая папка, в которую переносится.
+
 Экономь шаги — их число ограничено:
 - В одном ответе отправляй сразу все нужные команды: например, 5–10 @read_file подряд, а не по одному файлу за ответ.
 - Структура проекта ниже уже показана — не смотри повторно то, что в ней видно. Чтобы увидеть глубже, используй @list_dir ПАПКА | 3.
@@ -100,6 +112,7 @@ export function buildAgentPrompt(
 - В выгрузке конфигурации 1С модули лежат так: <Тип>/<Имя>/Ext/ObjectModule.bsl, ManagerModule.bsl, Module.bsl (общие модули), Forms/<Форма>/Ext/Form/Module.bsl.
 - Перед правкой прочитай файл: SEARCH должен в точности совпадать с текстом файла и быть уникальным. В одном @edit_file может быть несколько блоков.
 - Каждый @edit_file и @create_file закрывай строкой @end.
+- «Перенеси», «перемести», «переименуй» — только @move_file (не создавай копию через @create_file). «Скопируй» — @copy_file, «удали» — @delete_file.
 - Если пользователь просит запомнить правило («запомни…», «всегда делай…», «добавь правило…») — записывай его в папку .rules/: один файл на тему (.rules/naming.md, .rules/code-style.md…), сначала проверь, есть ли подходящий файл.
 - В итоговом ответе перечисляй только то, что действительно сделано по результатам команд.
 - Я выполню команды и пришлю результат. Когда информации достаточно — дай обычный ответ без команд.
@@ -110,7 +123,7 @@ ${projectTree.text}
 ${renderContext(context)}Вопрос пользователя: ${question}`;
 }
 
-const LINE_COMMAND = /^\s*@(list_dir|read_file|search|edit_file|create_file)\b[ \t]*(.*)$/;
+const LINE_COMMAND = /^\s*@(list_dir|read_file|search|edit_file|create_file|move_file|copy_file|delete_file)\b[ \t]*(.*)$/;
 
 /** Найти команды в ответе модели. Пустой массив — это обычный ответ */
 export function parseCommands(text: string): AgentCommand[] {
@@ -142,6 +155,11 @@ function parseLineCommands(text: string): AgentCommand[] {
     } else if (kind === 'search') {
       const [query, glob] = rawArg.split(/\s+\|\s+/).map(unquote);
       if (query) commands.push({ kind: 'search', query, glob: glob || undefined });
+    } else if (kind === 'delete_file') {
+      if (arg) commands.push({ kind, path: arg });
+    } else if (kind === 'move_file' || kind === 'copy_file') {
+      const pair = splitPathPair(rawArg);
+      if (pair) commands.push({ kind, from: pair[0], to: pair[1] });
     } else {
       // Тело блока — до @end. Модель иногда забывает @end: тогда блок закрывает следующая @-команда или конец ответа
       const body: string[] = [];
@@ -222,6 +240,13 @@ export function parseSearchReplace(body: string): SearchReplace[] {
   for (const m of body.matchAll(re)) {
     edits.push({ search: m[1], replace: m[2] });
   }
+  if (edits.length > 0) return edits;
+  // Модель иногда закрывает блок вторым «=======» вместо «>>>>>>> REPLACE» (наблюдалось на живом API)
+  // или не закрывает вовсе: тогда REPLACE — до такой строки, до следующего SEARCH или до конца тела
+  const loose = /<{5,9} SEARCH\r?\n([\s\S]*?)\r?\n={5,9}[ \t]*\r?\n([\s\S]*?)(?:\r?\n={5,9}[ \t]*(?=\r?\n|$)|(?=\r?\n<{5,9} SEARCH)|\r?\n?$)/g;
+  for (const m of body.matchAll(loose)) {
+    edits.push({ search: m[1], replace: m[2].replace(/\r?\n$/, '') });
+  }
   return edits;
 }
 
@@ -230,7 +255,7 @@ export function stripCommandsForDisplay(text: string): string {
   return text
     // Блоки правок — до @end или до конца (ещё печатается)
     .replace(/^[ \t]*@(edit_file|create_file)\b[\s\S]*?(^[ \t]*@end[ \t]*$|(?![\s\S]))/gm, '')
-    .replace(/^[ \t]*@(list_dir|read_file|search)\b.*$/gm, '')
+    .replace(/^[ \t]*@(list_dir|read_file|search|move_file|copy_file|delete_file)\b.*$/gm, '')
     // Недописанная команда в конце стрима: «@rea»
     .replace(/(^|\n)[ \t]*@\w*$/, '')
     // XML-вариант
@@ -298,7 +323,106 @@ export function describeCommand(cmd: AgentCommand): string {
       return `✏️ Предлагаю правку ${cmd.path}`;
     case 'create_file':
       return `🆕 Предлагаю создать ${cmd.path}`;
+    case 'move_file':
+      return `🚚 Предлагаю перенести ${cmd.from} → ${cmd.to}`;
+    case 'copy_file':
+      return `📑 Предлагаю скопировать ${cmd.from} → ${cmd.to}`;
+    case 'delete_file':
+      return `🗑️ Предлагаю удалить ${cmd.path}`;
   }
+}
+
+// --- Проверка синтаксиса BSL после правки ---
+
+// Фрагмент для проверки модель передаёт в инструмент целиком — большой модуль она печатала бы минутами
+export const MAX_SYNTAX_FRAGMENT_CHARS = 20_000;
+const METHOD_START = /^\s*(Асинх\s+|Async\s+)?(Процедура|Функция|Procedure|Function)\s/i;
+// \b в JS не работает с кириллицей — граница слова через пробел, «;» или конец строки
+const METHOD_END = /^\s*(КонецПроцедуры|КонецФункции|EndProcedure|EndFunction)(?=[\s;]|$)/i;
+
+export function isBslPath(path: string): boolean {
+  return /\.(bsl|os)$/i.test(path);
+}
+
+/**
+ * Код для проверки синтаксиса после правки: процедуры и функции, в которые попали изменённые фрагменты, целиком
+ * (с директивами &НаСервере над ними). Правка вне процедур — весь модуль. undefined — проверять нечего или слишком много.
+ */
+export function changedCode(text: string, fragments: string[]): string | undefined {
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  const full = lines.join('\n');
+  const ranges: [number, number][] = [];
+  for (const fragment of fragments.map((f) => f.replace(/\r\n/g, '\n')).filter((f) => f.trim())) {
+    const located = locateFragment(lines, full, fragment);
+    if (!located) continue;
+    const [first, last] = located;
+    let start = first;
+    while (start >= 0 && !METHOD_START.test(lines[start]) && !(start < first && METHOD_END.test(lines[start]))) start--;
+    let end = last;
+    while (end < lines.length && !METHOD_END.test(lines[end]) && !(end > last && METHOD_START.test(lines[end]))) end++;
+    // Фрагмент не внутри процедуры (переменные модуля, области) — проверяем модуль целиком
+    if (start < 0 || !METHOD_START.test(lines[start]) || end >= lines.length || !METHOD_END.test(lines[end])) {
+      return full.length <= MAX_SYNTAX_FRAGMENT_CHARS ? full : undefined;
+    }
+    while (start > 0 && /^\s*&/.test(lines[start - 1])) start--;
+    ranges.push([start, end]);
+  }
+  if (ranges.length === 0) return undefined;
+  ranges.sort((a, b) => a[0] - b[0]);
+  const merged: [number, number][] = [];
+  for (const r of ranges) {
+    const prev = merged[merged.length - 1];
+    if (prev && r[0] <= prev[1] + 1) prev[1] = Math.max(prev[1], r[1]);
+    else merged.push([...r]);
+  }
+  const code = merged.map(([a, b]) => lines.slice(a, b + 1).join('\n')).join('\n\n');
+  return code.length <= MAX_SYNTAX_FRAGMENT_CHARS ? code : undefined;
+}
+
+/**
+ * Строки фрагмента в тексте: дословно, а если файл изменился после правки (форматирование при сохранении) —
+ * по первой или последней непустой строке фрагмента, если она в файле одна
+ */
+function locateFragment(lines: string[], full: string, fragment: string): [number, number] | undefined {
+  const fragmentLines = fragment.split('\n');
+  const at = full.indexOf(fragment);
+  if (at !== -1) {
+    const first = full.slice(0, at).split('\n').length - 1;
+    return [first, first + fragmentLines.length - 1];
+  }
+  const trimmed = lines.map((l) => l.trim());
+  const nonEmpty = fragmentLines.map((l) => l.trim()).filter(Boolean);
+  for (const [anchor, offset] of [
+    [nonEmpty[0], fragmentLines.findIndex((l) => l.trim() === nonEmpty[0])],
+    [nonEmpty[nonEmpty.length - 1], fragmentLines.map((l) => l.trim()).lastIndexOf(nonEmpty[nonEmpty.length - 1])],
+  ] as const) {
+    if (!anchor) continue;
+    const found = trimmed.flatMap((l, i) => (l === anchor ? [i] : []));
+    if (found.length !== 1) continue;
+    const first = Math.max(0, found[0] - offset);
+    return [first, Math.min(lines.length - 1, first + fragmentLines.length - 1)];
+  }
+  return undefined;
+}
+
+/** Просьба к модели проверить изменённый код серверным инструментом проверки синтаксиса */
+export function syntaxCheckRequest(path: string, code: string): string {
+  return (
+    `Проверь синтаксис изменённого кода ${path}: вызови инструмент mcp__syntax-checker__validate, параметр code — текст ниже (изменённые процедуры целиком). ` +
+    'Если найдены ошибки — исправь их через @edit_file. Если ошибок нет — продолжай задачу, в итоговом ответе коротко укажи результат проверки.\n' +
+    '```bsl\n' + code + '\n```'
+  );
+}
+
+/**
+ * «откуда | куда», «откуда -> куда», «откуда → куда» или два пути через пробел.
+ * Без явного разделителя пути с пробелами не разобрать — тогда только если слов ровно два
+ */
+function splitPathPair(raw: string): [string, string] | undefined {
+  const parts = raw.split(/\s+\|\s+|\s*(?:->|→)\s*/).map(unquote).filter(Boolean);
+  if (parts.length === 2) return [parts[0], parts[1]];
+  const words = raw.trim().split(/\s+/).map(unquote).filter(Boolean);
+  return words.length === 2 ? [words[0], words[1]] : undefined;
 }
 
 /** Убрать кавычки/бэктики вокруг аргумента: `src/a.bsl` → src/a.bsl */

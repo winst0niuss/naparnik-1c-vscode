@@ -21,6 +21,8 @@ export interface StreamCallbacks {
   unavailableToolHint?: string;
   /** Модель вызвала инструменты, которые мы отклонили (инструменты 1С:EDT) */
   onRejectedTools?: (toolNames: string[]) => void;
+  /** Напоминание модели, если ответ пришёл пустым (например, в агентном режиме — продолжить @-командами) */
+  emptyAnswerHint?: string;
 }
 
 // Инструменты сервиса, которые работают без 1С:EDT. Остальные (WriteSystemFile, GetObject_in_Project…)
@@ -35,6 +37,7 @@ export function isUsableServerTool(name: string | undefined): boolean {
 }
 
 const DEFAULT_UNAVAILABLE_HINT = 'Инструмент недоступен: работа идёт не из 1С:EDT, сессии проекта нет. Ответь без него.';
+const DEFAULT_EMPTY_ANSWER_HINT = 'Твой ответ пришёл пустым. Ответь, пожалуйста, на мой предыдущий вопрос текстом.';
 
 export interface ChatAnswer {
   text: string;
@@ -136,6 +139,9 @@ export class NaparnikClient {
       content: { content: { instruction: message } },
     };
     let hadToolCalls = false;
+    let emptyRetried = false;
+    // Последний ответ ассистента в этом обмене — от него можно продолжить, не теряя вопрос пользователя
+    let lastAssistantUuid: string | undefined;
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
       const result = await this.streamRequest(conversationId, payload, callbacks, signal);
@@ -152,6 +158,18 @@ export class NaparnikClient {
           text = unwrapToolResult(text);
         }
         if (!text) {
+          // Сервер изредка присылает пустой ответ (наблюдалось после отклонённых инструментов 1С:EDT).
+          // Один раз просим продолжить, а не роняем весь запрос
+          const continueFrom = result.assistantUuid ?? lastAssistantUuid;
+          if (!emptyRetried && continueFrom) {
+            emptyRetried = true;
+            payload = {
+              parent_uuid: continueFrom,
+              role: 'user',
+              content: { content: { instruction: callbacks.emptyAnswerHint ?? DEFAULT_EMPTY_ANSWER_HINT } },
+            };
+            continue;
+          }
           throw new Error('API не вернул текстовый ответ');
         }
         return { text, assistantUuid: result.assistantUuid };
@@ -161,6 +179,7 @@ export class NaparnikClient {
       if (!result.assistantUuid) {
         throw new Error('API вернул tool_calls без идентификатора сообщения');
       }
+      lastAssistantUuid = result.assistantUuid;
       const usable = accepted.filter((tc) => isUsableServerTool(tc.function?.name));
       if (usable.length > 0) {
         callbacks.onToolCalls?.(usable.map(toolName));
@@ -276,6 +295,10 @@ export class ApiError extends Error {
 function describeStatus(status: number, body: string): string {
   if (status === 401 || status === 403) {
     return `Токен не принят (HTTP ${status}). Проверьте токен командой «1С:Напарник: Задать токен».`;
+  }
+  if (status === 429) {
+    // Лимит считается на все чаты сразу: несколько ответов параллельно быстро его исчерпывают
+    return 'Сервис 1С:Напарник ограничил частоту сообщений (HTTP 429). Повторите позже. Лимит общий для всех чатов — параллельные ответы расходуют его быстрее.';
   }
   return `Ошибка API (HTTP ${status}): ${body.slice(0, 300)}`;
 }

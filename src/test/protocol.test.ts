@@ -1,6 +1,17 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { applySearchReplace, buildAgentPrompt, findUnfinishedWrite, looksLikeMalformedEdit, parseCommands, stripCommandsForDisplay } from '../agent/protocol';
+import {
+  applySearchReplace,
+  buildAgentPrompt,
+  changedCode,
+  describeCommand,
+  findUnfinishedWrite,
+  isBslPath,
+  looksLikeMalformedEdit,
+  parseCommands,
+  stripCommandsForDisplay,
+  syntaxCheckRequest,
+} from '../agent/protocol';
 
 test('команды чтения разбираются в порядке появления', () => {
   const cmds = parseCommands(
@@ -176,4 +187,69 @@ test('«@end» в той же строке, что и команда чтени�
     { kind: 'list_dir', path: 'src' },
     { kind: 'search', query: 'Dockerfile', glob: undefined },
   ]);
+});
+
+test('перенос, копирование, удаление: разделители «|», «->», «→», два пути через пробел', () => {
+  const cmds = parseCommands(
+    [
+      '@move_file src/a.bsl | src/b/a.bsl',
+      '@move_file `x.md` -> docs/',
+      '@copy_file a.txt → b.txt',
+      '@copy_file one.md two.md',
+      '@delete_file old/Модуль.bsl @end',
+      '@move_file только-один-путь',
+    ].join('\n'),
+  );
+  assert.deepEqual(cmds, [
+    { kind: 'move_file', from: 'src/a.bsl', to: 'src/b/a.bsl' },
+    { kind: 'move_file', from: 'x.md', to: 'docs/' },
+    { kind: 'copy_file', from: 'a.txt', to: 'b.txt' },
+    { kind: 'copy_file', from: 'one.md', to: 'two.md' },
+    { kind: 'delete_file', path: 'old/Модуль.bsl' },
+  ]);
+  assert.equal(stripCommandsForDisplay('Переношу.\n@move_file a | b\n@delete_file c'), 'Переношу.');
+  assert.equal(describeCommand({ kind: 'move_file', from: 'a', to: 'b' }), '🚚 Предлагаю перенести a → b');
+});
+
+const MODULE = [
+  'Перем мКэш;',
+  '',
+  '&НаСервере',
+  'Процедура Первая()',
+  '\tА = 1;',
+  'КонецПроцедуры',
+  '',
+  'Функция Вторая(П) Экспорт',
+  '\tВозврат П + 1;',
+  'КонецФункции',
+  '',
+  'Процедура Третья()',
+  '\tБ = 2;',
+  'КонецПроцедуры',
+].join('\r\n');
+
+test('changedCode: изменённые процедуры целиком, с директивой; правка вне процедур — весь модуль', () => {
+  assert.equal(changedCode(MODULE, ['\tА = 1;']), '&НаСервере\nПроцедура Первая()\n\tА = 1;\nКонецПроцедуры');
+  // Две правки в разных процедурах — обе, по порядку, без лишней между ними
+  assert.equal(
+    changedCode(MODULE, ['\tБ = 2;', '\tА = 1;']),
+    '&НаСервере\nПроцедура Первая()\n\tА = 1;\nКонецПроцедуры\n\nПроцедура Третья()\n\tБ = 2;\nКонецПроцедуры',
+  );
+  assert.equal(changedCode(MODULE, ['Перем мКэш;']), MODULE.replace(/\r\n/g, '\n'));
+  assert.equal(changedCode(MODULE, ['нет такого']), undefined);
+  // Файл изменился после правки (форматирование) — фрагмент находится по первой строке
+  assert.equal(changedCode(MODULE, ['Процедура Третья()\n    Б = 2;']), 'Процедура Третья()\n\tБ = 2;\nКонецПроцедуры');
+  assert.equal(changedCode(MODULE, ['']), undefined);
+  assert.equal(changedCode('Процедура А()\n' + 'х = 1;\n'.repeat(5000) + 'КонецПроцедуры', ['х = 1;']), undefined, 'слишком большой фрагмент не проверяем');
+  assert.ok(isBslPath('Ext/Module.bsl') && isBslPath('a.os') && !isBslPath('a.md'));
+  assert.match(syntaxCheckRequest('m.bsl', 'КОД'), /mcp__syntax-checker__validate[\s\S]*```bsl\nКОД\n```$/);
+});
+
+test('блок правки, закрытый «=======» вместо «>>>>>>> REPLACE» или не закрытый (так пишет реальная модель)', () => {
+  const closedBySeparator = parseCommands('@edit_file m.bsl\n<<<<<<< SEARCH\nА = 1;\n=======\nА = 2;\nБ = 3;\n=======\n@end');
+  assert.deepEqual(closedBySeparator, [{ kind: 'edit_file', path: 'm.bsl', edits: [{ search: 'А = 1;', replace: 'А = 2;\nБ = 3;' }] }]);
+  const unclosed = parseCommands('@edit_file m.bsl\n<<<<<<< SEARCH\nА = 1;\n=======\nА = 2;\n@end');
+  assert.deepEqual(unclosed, [{ kind: 'edit_file', path: 'm.bsl', edits: [{ search: 'А = 1;', replace: 'А = 2;' }] }]);
+  const two = parseCommands('@edit_file m.bsl\n<<<<<<< SEARCH\nА\n=======\nБ\n<<<<<<< SEARCH\nВ\n=======\nГ\n@end');
+  assert.deepEqual(two[0].kind === 'edit_file' && two[0].edits, [{ search: 'А', replace: 'Б' }, { search: 'В', replace: 'Г' }]);
 });

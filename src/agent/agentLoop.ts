@@ -4,12 +4,16 @@
  */
 import { ChatAnswer, StreamCallbacks } from '../api/client';
 import {
+  AGENT_EMPTY_ANSWER_HINT,
   AGENT_UNAVAILABLE_TOOL_HINT,
   AgentCommand,
   MALFORMED_EDIT_HINT,
+  changedCode,
   describeCommand,
+  isBslPath,
   looksLikeMalformedEdit,
   parseCommands,
+  syntaxCheckRequest,
 } from './protocol';
 
 /** То, что нужно циклу от клиента API */
@@ -20,6 +24,8 @@ export interface AgentClient {
 /** То, что нужно циклу от инструментов проекта */
 export interface AgentTools {
   run(cmd: AgentCommand): Promise<string>;
+  /** Текст файла после правки — для проверки синтаксиса BSL. Нет метода — проверка не просится */
+  readFileText?(path: string): Promise<string>;
 }
 
 export interface AgentLoopOptions {
@@ -43,8 +49,9 @@ export interface AgentLoopOptions {
   /**
    * Проверка, что задача выполнена (например, /init создал NAPARNIK.md).
    * Возвращает подсказку модели, если не выполнена, — тогда цикл продолжается (до двух раз).
+   * answerText — ответ модели без команд (по нему видно, отказалась ли модель или решила, что делать нечего).
    */
-  checkDone?: (executed: AgentCommand[]) => string | undefined;
+  checkDone?: (executed: AgentCommand[], answerText: string) => string | undefined;
 }
 
 export interface AgentLoopResult extends ChatAnswer {
@@ -68,15 +75,25 @@ const READ_COMMANDS = new Set<AgentCommand['kind']>(['list_dir', 'read_file', 's
 export function looksLikeUnfinishedIntent(text: string): boolean {
   const t = text.trim();
   if (t.length > 500) return false;
+  // «Использую @-команды:» — короткий ответ, оборванный на двоеточии, явно не итог (наблюдалось на живом API)
+  if (t.length < 200 && t.endsWith(':')) return true;
   // Глагол действия «сейчас/дальше» — признак намерения; «создан», «готово» — признак выполненной задачи.
   // Границы слов — через пробелы/знаки: \b в JS не работает с кириллицей
   const word = (re: string) => new RegExp(`(^|[\\s,.!:;«(—-])(${re})(?=[\\s,.!:;»)—-]|$)`, 'i');
-  const intent = word('читаю|прочитаю|смотрю|посмотрю|изучу|изучаю|проверю|открою|найду|поищу|начну|продолжу|перейду|сейчас|далее|дальше|затем');
+  const intent = word(
+    'читаю|прочитаю|смотрю|посмотрю|изучу|изучаю|проверю|открою|найду|поищу|начну|продолжу|перейду|сейчас|далее|дальше|затем|' +
+      'нужно|надо|добавлю|исправлю|внесу|изменю|создам|сделаю|допишу|перенесу|удалю',
+  );
   const done = word('создан[аоы]?|создал[аи]?|готово|готов|применен[аоы]?|применил[аи]?|выполнен[аоы]?|сделан[аоы]?|добавлен[аоы]?|изменен[аоы]?|итог[а-я]*');
   return intent.test(t) && !done.test(t);
 }
 
 export const CONTINUE_HINT = 'Ты описал, что собираешься сделать, но не прислал команд. Выполни это сейчас командами (@read_file, @list_dir, @search, @create_file…) — несколько в одном ответе.';
+
+/** Правка или создание файла действительно выполнены (не отклонены и не упали) */
+function isApplied(result: string): boolean {
+  return /^Правка .+ применена\.$|^Файл .+ создан\.$/.test(result.trim());
+}
 
 export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult> {
   const { client, conversationId, tools, maxSteps, signal } = opts;
@@ -97,6 +114,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         onToolCalls: opts.onToolCalls,
         onRejectedTools: opts.onRejectedTools,
         unavailableToolHint: tools ? AGENT_UNAVAILABLE_TOOL_HINT : undefined,
+        emptyAnswerHint: tools ? AGENT_EMPTY_ANSWER_HINT : undefined,
       },
       signal,
     );
@@ -112,7 +130,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     }
     if (commands.length === 0) {
       // Ответ без команд, но задача явно не доделана — до двух напоминаний, если шаги ещё есть
-      const notDone = opts.checkDone?.(executed) ?? (tools && looksLikeUnfinishedIntent(answer.text) ? CONTINUE_HINT : undefined);
+      const notDone = opts.checkDone?.(executed, answer.text) ?? (tools && looksLikeUnfinishedIntent(answer.text) ? CONTINUE_HINT : undefined);
       if (tools && notDone && nudges < 2 && !finishing && step < maxSteps) {
         nudges++;
         opts.onNextRound?.();
@@ -132,16 +150,28 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     }
 
     const results: string[] = [];
+    const checks = new Map<string, string[]>(); // изменённые модули BSL → фрагменты правок
     for (const cmd of commands) {
       const description = describeCommand(cmd);
       opts.onStep?.(description);
-      results.push(`### ${description}\n${await tools!.run(cmd)}`);
+      const result = await tools!.run(cmd);
+      results.push(`### ${description}\n${result}`);
       executed.push(cmd);
       // Пока пользователь смотрел diff, запрос могли остановить
       if (signal.aborted) throw new Error('Остановлено');
+      if ((cmd.kind === 'edit_file' || cmd.kind === 'create_file') && isBslPath(cmd.path) && isApplied(result)) {
+        const fragments = cmd.kind === 'edit_file' ? cmd.edits.map((e) => e.replace) : [cmd.content];
+        checks.set(cmd.path, [...(checks.get(cmd.path) ?? []), ...fragments]);
+      }
     }
     opts.onNextRound?.();
     message = `Результаты команд:\n\n${results.join('\n\n')}`;
+    // Применённую правку модуля 1С модель проверяет серверным инструментом проверки синтаксиса
+    for (const [path, fragments] of checks) {
+      const text = await tools!.readFileText?.(path).catch(() => undefined);
+      const code = text === undefined ? undefined : changedCode(text, fragments);
+      if (code) message += `\n\n${syntaxCheckRequest(path, code)}`;
+    }
 
     if (finishing) {
       // Правки по FINISH_HINT выполнены — дальше только итоговый ответ

@@ -27,6 +27,10 @@
   let commands = [];
   let menuItems = [];
   let menuIndex = 0;
+  // Меню общее: слэш-команды или файлы для @-упоминания (список приходит из расширения)
+  let menuMode = 'slash';
+  let mentionQuery = null;
+  let mentionTimer = null;
 
   form.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -47,7 +51,7 @@
       }
       if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey && !e.isComposing)) {
         e.preventDefault();
-        chooseCommand(menuItems[menuIndex], e.key === 'Enter');
+        chooseItem(menuItems[menuIndex], e.key === 'Enter');
         return;
       }
       if (e.key === 'Escape') {
@@ -91,14 +95,40 @@
     const item = e.target.closest('[data-index]');
     if (!item) return;
     e.preventDefault();
-    chooseCommand(menuItems[Number(item.dataset.index)], true);
+    chooseItem(menuItems[Number(item.dataset.index)], true);
   });
+  // Курсор переместили стрелками или мышью — подсказка по @ могла стать неактуальной
+  input.addEventListener('click', updateMenu);
 
   function updateMenu() {
     const m = input.value.match(/^\/([\w-]*)$/);
-    if (!m || commands.length === 0) return hideMenu();
-    const query = m[1].toLowerCase();
-    menuItems = commands.filter((c) => c.name.startsWith(query));
+    if (m && commands.length > 0) {
+      menuMode = 'slash';
+      mentionQuery = null;
+      const query = m[1].toLowerCase();
+      menuItems = commands.filter((c) => c.name.startsWith(query));
+      if (menuItems.length === 0) return hideMenu();
+      menuIndex = Math.min(menuIndex, menuItems.length - 1);
+      renderMenu();
+      slashMenu.classList.remove('hidden');
+      return;
+    }
+    // «@часть-пути» прямо перед курсором — просим у расширения подходящие файлы
+    const mention = input.value.slice(0, input.selectionStart).match(/(?:^|\s)@([^\s"]*)$/);
+    if (!mention) {
+      mentionQuery = null;
+      return hideMenu();
+    }
+    menuMode = 'mention';
+    mentionQuery = mention[1];
+    clearTimeout(mentionTimer);
+    mentionTimer = setTimeout(() => vscode.postMessage({ type: 'mentionQuery', query: mentionQuery }), 80);
+  }
+
+  function showMentionResults(query, paths) {
+    // Ответ на устаревший запрос (пользователь печатает дальше) не показываем
+    if (menuMode !== 'mention' || query !== mentionQuery) return;
+    menuItems = paths.map((p) => ({ path: p }));
     if (menuItems.length === 0) return hideMenu();
     menuIndex = Math.min(menuIndex, menuItems.length - 1);
     renderMenu();
@@ -113,10 +143,17 @@
       row.dataset.index = i;
       const name = document.createElement('span');
       name.className = 'slash-name';
-      name.textContent = '/' + c.name;
       const desc = document.createElement('span');
       desc.className = 'slash-desc';
-      desc.textContent = c.description;
+      if (c.path !== undefined) {
+        const slash = c.path.lastIndexOf('/');
+        name.textContent = c.path.slice(slash + 1);
+        desc.textContent = slash > 0 ? c.path.slice(0, slash) : '';
+        row.title = c.path;
+      } else {
+        name.textContent = '/' + c.name;
+        desc.textContent = c.description;
+      }
       row.append(name, desc);
       slashMenu.appendChild(row);
     });
@@ -126,6 +163,24 @@
   function hideMenu() {
     slashMenu.classList.add('hidden');
     menuIndex = 0;
+  }
+
+  function chooseItem(item, run) {
+    if (menuMode === 'mention') insertMention(item);
+    else chooseCommand(item, run);
+  }
+
+  /** Заменить «@часть» перед курсором полным путём файла; путь с пробелами — в кавычках */
+  function insertMention(item) {
+    if (!item) return;
+    hideMenu();
+    const caret = input.selectionStart;
+    const token = /\s/.test(item.path) ? '@"' + item.path + '" ' : '@' + item.path + ' ';
+    const before = input.value.slice(0, caret).replace(/@[^\s"]*$/, token);
+    input.value = before + input.value.slice(caret);
+    input.setSelectionRange(before.length, before.length);
+    mentionQuery = null;
+    input.focus();
   }
 
   /** Выбор команды: Enter — сразу выполнить, Tab — только дописать в поле */
@@ -189,6 +244,9 @@
       case 'commands':
         commands = msg.list || [];
         break;
+      case 'mentionResults':
+        showMentionResults(msg.query, msg.items || []);
+        break;
       case 'info':
         addInfo(msg.text);
         break;
@@ -210,13 +268,35 @@
         card.dataset.id = msg.id;
         const title = document.createElement('div');
         title.className = 'edit-title';
-        title.textContent = (msg.isNew ? '🆕 Создать файл ' : '✏️ Изменить файл ') + msg.label + '?';
         const hint = document.createElement('div');
         hint.className = 'edit-hint';
-        hint.textContent = 'Изменения открыты во вкладке diff. Enter — применить, Esc — отклонить.';
         const buttons = document.createElement('div');
         buttons.className = 'edit-buttons';
-        buttons.innerHTML = '<button data-accept="1">Применить</button><button class="secondary" data-accept="0">Отклонить</button>';
+        const op = msg.operation;
+        card.dataset.operation = op ? '1' : '';
+        if (op) {
+          // Перенос, копирование, удаление: diff нет — всё видно в карточке
+          const what = op.isDir ? 'папку ' : '';
+          title.textContent =
+            op.kind === 'move' ? '🚚 Перенести ' + what + op.from + ' → ' + op.to + '?'
+            : op.kind === 'copy' ? '📑 Скопировать ' + what + op.from + ' → ' + op.to + '?'
+            : '🗑️ Удалить ' + what + op.from + '? (в корзину)';
+          hint.textContent = 'Enter — выполнить, Esc — отклонить.';
+          if (op.isDir) {
+            const list = document.createElement('div');
+            list.className = 'edit-files';
+            const more = op.totalFiles - op.files.length;
+            list.textContent = op.totalFiles === 0
+              ? 'Папка пуста.'
+              : 'Файлов: ' + op.totalFiles + '\n' + op.files.join('\n') + (more > 0 ? '\n… ещё ' + more : '');
+            card.append(list);
+          }
+          buttons.innerHTML = '<button data-accept="1">Выполнить</button><button class="secondary" data-accept="0">Отклонить</button>';
+        } else {
+          title.textContent = (msg.isNew ? '🆕 Создать файл ' : '✏️ Изменить файл ') + msg.label + '?';
+          hint.textContent = 'Изменения открыты во вкладке diff. Enter — применить, Esc — отклонить.';
+          buttons.innerHTML = '<button data-accept="1">Применить</button><button class="secondary" data-accept="0">Отклонить</button>';
+        }
         buttons.addEventListener('click', (e) => {
           const btn = e.target.closest('button');
           if (!btn) return;
@@ -228,12 +308,13 @@
             resolveEdit(msg.id, false);
           }
         });
-        card.append(title, hint, buttons);
+        card.prepend(title, hint);
+        card.append(buttons);
         if (currentAnswer) messagesEl.insertBefore(card, currentAnswer);
         else messagesEl.appendChild(card);
         // Фокус на «Применить» — Enter сразу применяет. Если пользователь что-то печатает, не мешаем
         if (!input.value.trim()) buttons.querySelector('button').focus();
-        if (currentStatus) setStatus('Жду вашего решения по правке', WAIT_FRAMES);
+        if (currentStatus) setStatus(op ? 'Жду вашего решения' : 'Жду вашего решения по правке', WAIT_FRAMES);
         scrollToBottom();
         break;
       }
@@ -242,7 +323,7 @@
         if (card) {
           card.classList.add('resolved');
           card.querySelector('.edit-hint').remove();
-          card.querySelector('.edit-buttons').textContent = msg.accepted ? '✅ Применено' : '❌ Отклонено';
+          card.querySelector('.edit-buttons').textContent = msg.accepted ? (card.dataset.operation ? '✅ Выполнено' : '✅ Применено') : '❌ Отклонено';
         }
         if (currentStatus) setStatus('Напарник думает', THINK_FRAMES);
         break;
@@ -266,6 +347,7 @@
         if (!currentStatus) break;
         // План задач модели — не поиск
         if (msg.names.every((n) => n === 'TodoWrite')) setStatus('Составляю план', THINK_FRAMES);
+        else if (msg.names.every((n) => /__validate$/.test(n) || n === 'TodoWrite')) setStatus('Проверяю синтаксис', SEARCH_FRAMES);
         else setStatus('Ищу: ' + msg.names.filter((n) => n !== 'TodoWrite').map(humanToolName).join(', '), SEARCH_FRAMES);
         break;
       case 'assistantText':
@@ -428,7 +510,7 @@
     ]
       .filter(([n]) => n > 0)
       .map(([n, one, few, many]) => n + ' ' + plural(n, one, few, many));
-    const edits = count('✏️') + count('🆕');
+    const edits = count('✏️') + count('🆕') + count('🚚') + count('📑') + count('🗑️');
     const viewed = parts.length > 0 ? 'Просмотрено: ' + parts.join(', ') : '';
     const proposed = edits > 0 ? 'предложено правок: ' + edits : '';
     return [viewed, proposed].filter(Boolean).join('; ').replace(/^п/, 'П') || steps.length + ' ' + plural(steps.length, 'шаг', 'шага', 'шагов');

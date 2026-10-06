@@ -3,6 +3,18 @@ import * as path from 'node:path';
 
 export const PROPOSED_SCHEME = 'naparnik-proposed';
 
+/** Перенос, копирование или удаление — подтверждается карточкой в чате, без diff */
+export interface FileOperation {
+  kind: 'move' | 'copy' | 'delete';
+  /** Пути относительно проекта */
+  from: string;
+  to?: string;
+  isDir: boolean;
+  /** Файлы внутри папки (первые — для карточки) и их общее число */
+  files: string[];
+  totalFiles: number;
+}
+
 export interface PendingEdit {
   id: number;
   /** Путь относительно проекта — для карточки в чате */
@@ -10,6 +22,8 @@ export interface PendingEdit {
   isNew: boolean;
   /** Чат, в котором предложена правка: карточка показывается только в нём */
   owner?: string;
+  /** Не правка текста, а операция с файлом */
+  operation?: FileOperation;
 }
 
 /**
@@ -51,6 +65,24 @@ export class EditPreview implements vscode.TextDocumentContentProvider {
     const id = Number(uri?.path.split('/')[1]);
     if (id) this.resolve(id, accepted);
   }
+
+  /** Подтверждение переноса, копирования или удаления — только карточкой в чате */
+  confirmOperation = async (operation: FileOperation, signal?: AbortSignal, owner?: string): Promise<boolean> => {
+    const id = ++this.counter;
+    const decision = new Promise<boolean>((resolve) => this.decisions.set(id, resolve));
+    const onAbort = () => this.resolve(id, false);
+    signal?.addEventListener('abort', onAbort);
+    try {
+      if (signal?.aborted) return false;
+      this.startEmitter.fire({ id, label: operation.from, isNew: false, owner, operation });
+      const accepted = await decision;
+      this.endEmitter.fire({ id, accepted, owner });
+      return accepted;
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+      this.decisions.delete(id);
+    }
+  };
 
   confirm = async (
     target: vscode.Uri,

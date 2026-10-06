@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { AgentClient, FINISH_HINT, runAgentLoop } from '../agent/agentLoop';
+import { AgentClient, FINISH_HINT, looksLikeUnfinishedIntent, runAgentLoop } from '../agent/agentLoop';
 import { AgentCommand, parseCommands } from '../agent/protocol';
 
 /** Мок модели: отвечает заранее заданными текстами и запоминает, что ей прислали */
@@ -108,4 +108,45 @@ test('looksLikeUnfinishedIntent: намерения ловим, завершён
     assert.ok(looksLikeUnfinishedIntent(t), t);
   for (const t of ['Отлично, файл NAPARNIK.md создан.', 'Хорошо, правка применена.', 'Итак, модуль проводит документ по регистру ТоварыНаСкладах.', 'Готово: добавлена проверка количества.', 'Модуль выводит сообщение пользователю.'])
     assert.ok(!looksLikeUnfinishedIntent(t), t);
+});
+
+test('проверка синтаксиса: после применённой правки .bsl модель получает изменённую процедуру', async () => {
+  const module = 'Процедура А()\n\tх = 1;\nКонецПроцедуры\n\nПроцедура Б()\nКонецПроцедуры';
+  const edit = '@edit_file M.bsl\n<<<<<<< SEARCH\n\tх = 0;\n=======\n\tх = 1;\n>>>>>>> REPLACE\n@end';
+  const { client, sent } = scriptedClient([edit, 'Готово, ошибок нет']);
+  const agentTools = {
+    run: async (c: AgentCommand) => (c.kind === 'edit_file' ? `Правка ${c.path} применена.` : 'ок'),
+    readFileText: async () => module,
+  };
+  await runAgentLoop({ ...base, client, tools: agentTools, maxSteps: 12 });
+  assert.match(sent[1], /mcp__syntax-checker__validate/);
+  assert.ok(sent[1].includes('```bsl\nПроцедура А()\n\tх = 1;\nКонецПроцедуры\n```'), 'только изменённая процедура');
+});
+
+test('проверка синтаксиса не просится: правка отклонена, не BSL или нет чтения файла', async () => {
+  const edit = (p: string) => `@edit_file ${p}\n<<<<<<< SEARCH\nа\n=======\nб\n>>>>>>> REPLACE\n@end`;
+  const cases: [string, (c: AgentCommand) => string, boolean][] = [
+    ['M.bsl', () => 'Пользователь отклонил правку M.bsl.', true],
+    ['a.md', (c) => `Правка ${'path' in c ? c.path : ''} применена.`, true],
+    ['M.bsl', () => 'Правка M.bsl применена.', false],
+  ];
+  for (const [path, result, canRead] of cases) {
+    const { client, sent } = scriptedClient([edit(path), 'Готово']);
+    const agentTools = { run: async (c: AgentCommand) => result(c), ...(canRead ? { readFileText: async () => 'б' } : {}) };
+    await runAgentLoop({ ...base, client, tools: agentTools, maxSteps: 12 });
+    assert.doesNotMatch(sent[1], /syntax-checker/, path);
+  }
+});
+
+test('короткий ответ, оборванный на двоеточии, — намерение: модель получает напоминание', async () => {
+  assert.ok(looksLikeUnfinishedIntent('Использую @-команды:'));
+  assert.ok(!looksLikeUnfinishedIntent('Ответ: 42'));
+  assert.ok(looksLikeUnfinishedIntent('Вижу текущую процедуру `ОбработкаПроведения`. Нужно добавить проверку заполнения реквизита `Клиент`.'));
+  assert.ok(!looksLikeUnfinishedIntent('Проверка добавлена в ОбработкаПроведения.'));
+  const { client, sent } = scriptedClient(['Использую @-команды:', '@read_file a.bsl', 'Готово']);
+  const t = tools();
+  const r = await runAgentLoop({ ...base, client, tools: t.tools, maxSteps: 12 });
+  assert.equal(r.text, 'Готово');
+  assert.equal(t.ran.length, 1);
+  assert.match(sent[1], /не прислал команд/);
 });

@@ -90,6 +90,62 @@ test('401 превращается в понятную ошибку про то�
   }
 });
 
+test('429: понятное сообщение без технических подробностей', async () => {
+  const body = { error: 'Rate limit exceeded for message creation. Try again in 123 seconds.', error_type: 'rate_limit_exceeded' };
+  const mock = await startMock((path) => (path.endsWith('/conversations/') ? { json: { uuid: 'conv-1' } } : { status: 429, json: body }));
+  try {
+    const id = await mock.client.createConversation();
+    await assert.rejects(
+      mock.client.sendMessage(id, 'Вопрос', undefined, { onText: () => {} }),
+      /^Error: Сервис 1С:Напарник ограничил частоту сообщений \(HTTP 429\)\. Повторите позже\./,
+    );
+  } finally {
+    mock.close();
+  }
+});
+
+test('пустой ответ после отклонённого инструмента: один раз просим продолжить, затем ответ', async () => {
+  let calls = 0;
+  const mock = await startMock((path) => {
+    if (path.endsWith('/conversations/')) return { json: { uuid: 'conv-1' } };
+    calls++;
+    if (calls === 1) {
+      return { sse: [{ role: 'assistant', uuid: 'asst-1', content: { tool_calls: [{ id: 'c-edt', function: { name: 'ReadSystemFile' } }] }, finished: true }] };
+    }
+    if (calls === 2) return { sse: [{ role: 'assistant', uuid: 'asst-2', finished: true }] }; // пустой ответ
+    return { sse: [{ role: 'assistant', uuid: 'asst-3', content_delta: '@read_file a.md' }, { role: 'assistant', finished: true }] };
+  });
+  try {
+    const id = await mock.client.createConversation();
+    const answer = await mock.client.sendMessage(id, 'Вопрос', undefined, { onText: () => {}, emptyAnswerHint: 'продолжи командами' });
+    assert.deepEqual(answer, { text: '@read_file a.md', assistantUuid: 'asst-3' });
+    const retry = mock.requests[3].body;
+    assert.equal(retry.role, 'user');
+    assert.equal(retry.parent_uuid, 'asst-2');
+    assert.equal(retry.content.content.instruction, 'продолжи командами');
+  } finally {
+    mock.close();
+  }
+});
+
+test('пустой ответ повторно или без uuid — ошибка, без бесконечных повторов', async () => {
+  const mock = await startMock((path) =>
+    path.endsWith('/conversations/') ? { json: { uuid: 'conv-1' } } : { sse: [{ role: 'assistant', uuid: 'asst-x', finished: true }] },
+  );
+  const noUuid = await startMock((path) => (path.endsWith('/conversations/') ? { json: { uuid: 'conv-2' } } : { sse: [{ role: 'assistant', finished: true }] }));
+  try {
+    const id = await mock.client.createConversation();
+    await assert.rejects(mock.client.sendMessage(id, 'Вопрос', undefined, { onText: () => {} }), /не вернул текстовый ответ/);
+    assert.equal(mock.requests.length, 3); // дискуссия + вопрос + одно напоминание
+    const id2 = await noUuid.client.createConversation();
+    await assert.rejects(noUuid.client.sendMessage(id2, 'Вопрос', undefined, { onText: () => {} }), /не вернул текстовый ответ/);
+    assert.equal(noUuid.requests.length, 2); // продолжать не от чего — вопрос не теряем
+  } finally {
+    mock.close();
+    noUuid.close();
+  }
+});
+
 test('токен с кириллицей или пробелом отклоняется понятной ошибкой', () => {
   assert.equal(findTokenProblem('AbCdEfGhIjKlMnOpQrStUvWxYz12'), undefined);
   // «Р» (код 1056) — русская раскладка, как в исходной ошибке ByteString

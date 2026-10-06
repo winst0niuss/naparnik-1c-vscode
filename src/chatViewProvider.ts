@@ -29,6 +29,7 @@ import {
   scanReport,
   selectForImport,
 } from './agent/importSources';
+import { findMentions, formatMentionedFiles, rankPaths, resolveMention } from './agent/mentions';
 
 const PROJECT_ACCESS_KEY = 'naparnik.projectAccess';
 // Лимит шагов для /init и /make-rules: им нужно изучить проект, обычному вопросу — нет
@@ -36,6 +37,10 @@ const EXPLORE_MAX_STEPS = 25;
 const PROJECT_CONSENT_KEY = 'naparnik.projectAccessConsent';
 // Хеши файлов, перенесённых /import, — отдельно для каждого проекта
 const IMPORT_STATE_KEY = 'naparnik.importState';
+const SYNTAX_CHECK_STEP = '🧪 Проверяю синтаксис';
+// Список файлов для @-упоминаний строится обходом проекта — между нажатиями клавиш берём из кеша
+const MENTION_INDEX_TTL_MS = 30_000;
+const MAX_MENTION_INDEX_FILES = 50_000;
 
 /** Сообщения из webview в расширение */
 type WebviewMessage =
@@ -48,7 +53,8 @@ type WebviewMessage =
   | { type: 'toggleProject' }
   | { type: 'resolveEdit'; id: number; accepted: boolean }
   | { type: 'toggleEditorContext' }
-  | { type: 'insertCode'; code: string };
+  | { type: 'insertCode'; code: string }
+  | { type: 'mentionQuery'; query: string };
 
 /** Запрос, который выполняется в фоне — у каждого чата свой */
 interface RunningRequest {
@@ -72,6 +78,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // Пользователь выключил контекст редактора кликом по чипу — до смены файла
   private editorContextOff = false;
   private editorContextUri: string | undefined;
+  private mentionIndex: { root: string; at: number; paths: Promise<string[]> } | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -340,7 +347,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const found: FoundFile[] = [];
     for (const rel of await tools.findFiles((p) => classifyProjectFile(p) !== undefined)) {
       const kind = classifyProjectFile(rel)!;
-      const text = await tools.readProjectText(rel).catch(() => '');
+      const text = await tools.readFileText(rel).catch(() => '');
       if (text.trim()) found.push(makeFoundFile(kind.source, rel, text, false, kind.settings));
     }
     return [...found, ...(await readUserFiles())];
@@ -401,7 +408,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     if (!(await this.ensureProjectAccess('/import'))) return;
 
-    const done = await this.send(`/import ${sources.join(' ')}`, buildImportPrompt(selection), false, EXPLORE_MAX_STEPS, importDone);
+    const done = await this.send(`/import ${sources.join(' ')}`, buildImportPrompt(selection, await scanner.readRules()), false, EXPLORE_MAX_STEPS, importDone);
     if (done) {
       // Запоминаем переданные файлы: повторный /import возьмёт только новое и изменившееся
       const next = { ...this.workspaceState.get<ImportState>(IMPORT_STATE_KEY, {}) };
@@ -506,6 +513,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'insertCode':
         await insertIntoEditor(msg.code);
         break;
+      case 'mentionQuery': {
+        const tools = WorkspaceTools.forCurrentWorkspace(this.preview.confirm);
+        const items = tools ? rankPaths(msg.query, await this.mentionPaths(tools)) : [];
+        this.post({ type: 'mentionResults', query: msg.query, items });
+        break;
+      }
     }
   }
 
@@ -521,7 +534,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     modelText?: string,
     withEditorContext: boolean | 'force' = false,
     maxSteps = MAX_AGENT_STEPS,
-    checkDone?: (executed: AgentCommand[]) => string | undefined,
+    checkDone?: (executed: AgentCommand[], answerText: string) => string | undefined,
   ): Promise<boolean> {
     text = text.trim();
     // В одном чате — один запрос за раз; в других чатах можно спрашивать параллельно
@@ -542,7 +555,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Снимок редактора берём сразу: пока ждём ответа, пользователь может переключить файл
     const useEditor = withEditorContext === 'force' || (withEditorContext && !this.editorContextOff);
     const editorSnap = useEditor ? this.editorContext.snapshot() : undefined;
-    const context = editorSnap ? contextLabel(editorSnap) : undefined;
+    // @-упоминания — только в вопросе пользователя, не в развёрнутых инструкциях /init и /import
+    const mentioned = modelText === undefined ? await this.resolveMentions(text) : undefined;
+    const context = [editorSnap ? contextLabel(editorSnap) : undefined, mentioned?.label].filter(Boolean).join(' · ') || undefined;
 
     // Запоминаем чат: пользователь может переключиться, а ответ должен попасть сюда
     const chat = this.chat;
@@ -566,7 +581,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const client = new NaparnikClient({ token, ...readSettings() });
       chat.conversationId ??= await client.createConversation(run.abort.signal);
 
-      const tools = this.projectAccess ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm, run.abort.signal, chat.id) : undefined;
+      const tools = this.projectAccess ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm, run.abort.signal, chat.id, this.preview.confirmOperation)
+        : undefined;
       // Контекст редактора — перед вопросом: модель сразу видит, о каком файле и фрагменте речь.
       // Тот же неизменённый файл повторно не шлём — модель уже видела его в этом чате
       let editorBlock = editorSnap ? formatEditorContext(editorSnap) : '';
@@ -577,7 +593,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       } else if (editorHash) {
         chat.lastEditorContext = editorHash;
       }
-      const question = (editorBlock ? editorBlock + '\n\n' : '') + (modelText ?? text);
+      const question = [editorBlock, mentioned?.block, modelText ?? text].filter(Boolean).join('\n\n');
       let message = question;
       if (tools && !chat.agentPrimed) {
         // Первое сообщение с доступом к проекту: инструкция по командам, дерево, документация и правила
@@ -610,6 +626,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         onToolCalls: (names) => {
           run.toolNames = names;
           postIfVisible({ type: 'toolCalls', names });
+          // Проверка синтаксиса — заметный шаг в чате, а не только статус
+          if (names.some((n) => n.endsWith('__validate'))) {
+            chat.entries.push({ role: 'step', text: SYNTAX_CHECK_STEP });
+            postIfVisible({ type: 'step', text: SYNTAX_CHECK_STEP });
+          }
         },
         onRejectedTools: (names) => {
           const description = `⛔ Недоступно вне 1С:EDT: ${names.join(', ')}`;
@@ -648,6 +669,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.history.save(chat);
       }
     }
+  }
+
+  /** Пути файлов проекта (без игнорируемых git) для @-упоминаний — с кешем, чтобы не обходить проект на каждую букву */
+  private mentionPaths(tools: WorkspaceTools): Promise<string[]> {
+    const root = tools.rootUri.toString();
+    const cached = this.mentionIndex;
+    if (cached && cached.root === root && Date.now() - cached.at < MENTION_INDEX_TTL_MS) return cached.paths;
+    const paths = tools.findFiles(() => true, MAX_MENTION_INDEX_FILES).catch(() => []);
+    this.mentionIndex = { root, at: Date.now(), paths };
+    return paths;
+  }
+
+  /** Файлы, упомянутые в вопросе через @, — блок для модели и подпись под сообщением */
+  private async resolveMentions(text: string): Promise<{ block: string; label: string } | undefined> {
+    const tokens = findMentions(text);
+    const tools = tokens.length > 0 ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm) : undefined;
+    if (!tools) return undefined;
+    const paths = await this.mentionPaths(tools);
+    const files: { path: string; text: string }[] = [];
+    const notes: string[] = [];
+    for (const token of tokens) {
+      const found = resolveMention(token, paths);
+      if (found && 'path' in found) {
+        const content = await tools.readFileText(found.path).catch(() => undefined);
+        if (content === undefined) notes.push(`\`@${token}\` — не удалось прочитать (двоичный файл?)`);
+        else files.push({ path: found.path, text: content });
+      } else if (found) {
+        notes.push(`\`@${token}\` — подходит к ${found.candidates.length} файлам, уточните путь (подсказка появляется при вводе @)`);
+      } else if (/[./]/.test(token)) {
+        // «@Клиент» может быть просто словом, а «@a.bsl» — явно файл
+        notes.push(`\`@${token}\` — файл не найден`);
+      }
+    }
+    const { text: block, skipped } = formatMentionedFiles(files);
+    if (skipped.length) notes.push(`не приложены из-за объёма: ${skipped.map((p) => `\`${p}\``).join(', ')}`);
+    if (notes.length) this.info(`Упоминания файлов: ${notes.join('; ')}.`);
+    if (!block) return undefined;
+    const shown = files.filter((f) => !skipped.includes(f.path));
+    return { block, label: shown.map((f) => '@' + f.path.split('/').pop()).join(', ') };
   }
 
   /** Ответ пришёл в чат, который пользователь сейчас не видит, — сообщаем */
@@ -696,7 +756,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </button>
     </div>
     <div id="slash-menu" class="slash-menu hidden" role="listbox"></div>
-    <textarea id="input" rows="3" placeholder="Задай мне вопрос…&#10;Enter — отправить, Shift+Enter — новая строка"></textarea>
+    <textarea id="input" rows="3" placeholder="Задай мне вопрос… «/» — команды, «@» — файл проекта&#10;Enter — отправить, Shift+Enter — новая строка"></textarea>
     <div class="actions">
       <button type="button" id="stop" class="secondary hidden">Стоп</button>
       <button type="submit" id="send">Отправить</button>

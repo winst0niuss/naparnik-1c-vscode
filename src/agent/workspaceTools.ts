@@ -4,6 +4,7 @@ import { realpath } from 'node:fs/promises';
 import { AgentCommand, ProjectContext, applySearchReplace } from './protocol';
 import { PROJECT_DOC_DIRS, PROJECT_DOC_FILES, RULES_DIR } from '../slashCommands';
 import { globToRegExp, parseGitignore } from './gitignore';
+import type { FileOperation } from './editPreview';
 
 const MAX_FILE_CHARS = 60_000;
 // Документация прикладывается к первому сообщению, только если она короткая
@@ -29,6 +30,12 @@ export type ConfirmEdit = (
   owner?: string,
 ) => Promise<boolean>;
 
+/** Решение пользователя по переносу, копированию или удалению */
+export type ConfirmOperation = (operation: FileOperation, signal?: AbortSignal, owner?: string) => Promise<boolean>;
+
+// Сколько файлов папки показать в карточке подтверждения
+const MAX_OPERATION_FILES_SHOWN = 20;
+
 /**
  * Выполнение команд Напарника в открытой папке.
  * Все пути проверяются: выйти за пределы корня проекта нельзя.
@@ -40,11 +47,17 @@ export class WorkspaceTools {
     private readonly signal?: AbortSignal,
     // id чата — к нему привязываются карточки правок
     private readonly owner?: string,
+    private readonly confirmOperation?: ConfirmOperation,
   ) {}
 
-  static forCurrentWorkspace(confirmEdit: ConfirmEdit, signal?: AbortSignal, owner?: string): WorkspaceTools | undefined {
+  static forCurrentWorkspace(
+    confirmEdit: ConfirmEdit,
+    signal?: AbortSignal,
+    owner?: string,
+    confirmOperation?: ConfirmOperation,
+  ): WorkspaceTools | undefined {
     const folder = vscode.workspace.workspaceFolders?.[0];
-    return folder ? new WorkspaceTools(folder.uri, confirmEdit, signal, owner) : undefined;
+    return folder ? new WorkspaceTools(folder.uri, confirmEdit, signal, owner, confirmOperation) : undefined;
   }
 
   /** Выполнить команду и вернуть текст результата для модели (ошибки — тоже текстом) */
@@ -61,11 +74,18 @@ export class WorkspaceTools {
           return await this.editFile(cmd.path, cmd.edits);
         case 'create_file':
           return await this.createFile(cmd.path, cmd.content);
+        case 'move_file':
+          return await this.fileOperation('move', cmd.from, cmd.to);
+        case 'copy_file':
+          return await this.fileOperation('copy', cmd.from, cmd.to);
+        case 'delete_file':
+          return await this.fileOperation('delete', cmd.path);
       }
     } catch (err) {
       // Понятное модели сообщение вместо «EntryNotFound (FileSystemError)…»
       if (err instanceof vscode.FileSystemError && err.code === 'FileNotFound') {
-        return `Ошибка: не найдено — ${'path' in cmd ? cmd.path : ''}. Сверься с картой проекта или найди через @search.`;
+        const target = 'path' in cmd ? cmd.path : 'from' in cmd ? cmd.from : '';
+        return `Ошибка: не найдено — ${target}. Сверься с картой проекта или найди через @search.`;
       }
       return `Ошибка: ${err instanceof Error ? err.message : String(err)}`;
     }
@@ -195,8 +215,18 @@ export class WorkspaceTools {
   }
 
   /** Текст файла проекта по пути от корня (открытый — из редактора) */
-  async readProjectText(relPath: string): Promise<string> {
+  async readFileText(relPath: string): Promise<string> {
     return this.readText(await this.resolve(relPath));
+  }
+
+  /** Файлы правил .rules с текстом (для /import) */
+  async readRules(): Promise<{ path: string; text: string }[]> {
+    const rules: { path: string; text: string }[] = [];
+    for (const rel of await this.markdownFilesIn(RULES_DIR, 50)) {
+      const text = await this.readText(vscode.Uri.joinPath(this.root, rel)).catch(() => '');
+      if (text.trim()) rules.push({ path: rel, text });
+    }
+    return rules;
   }
 
   /** Список файлов правил .rules/*.md (для /rules) */
@@ -317,6 +347,103 @@ export class WorkspaceTools {
     }
     await this.write(uri, content);
     return `Файл ${relPath} создан.`;
+  }
+
+  /**
+   * Перенос, копирование или удаление файла или папки — после подтверждения карточкой в чате.
+   * Существующий файл не перезаписывается; удаление — в корзину ОС.
+   */
+  private async fileOperation(kind: FileOperation['kind'], fromRel: string, toRel?: string): Promise<string> {
+    if (!this.confirmOperation) return 'Ошибка: перенос, копирование и удаление файлов сейчас недоступны.';
+    const verb = { move: 'Перенос', copy: 'Копирование', delete: 'Удаление' }[kind];
+    const src = await this.resolve(fromRel);
+    if (!this.relative(src)) throw new Error('корень проекта переносить, копировать и удалять нельзя');
+    const isDir = Boolean((await vscode.workspace.fs.stat(src)).type & vscode.FileType.Directory);
+
+    let dst: vscode.Uri | undefined;
+    if (kind !== 'delete') {
+      dst = await this.resolve(toRel ?? '');
+      // «Перенеси в папку X» — модель часто указывает только папку назначения
+      if (await this.isDirectory(dst)) dst = vscode.Uri.joinPath(dst, path.basename(src.fsPath));
+      if (dst.fsPath === src.fsPath) return `Ошибка: ${fromRel} уже лежит по этому пути.`;
+      if (isInside(src.fsPath, dst.fsPath)) throw new Error('нельзя перенести или скопировать папку внутрь самой себя');
+      if (await this.exists(dst)) return `Ошибка: ${this.relative(dst)} уже существует — не перезаписываю. Выбери другой путь.`;
+    }
+
+    const files = isDir ? await this.filesUnder(src) : [];
+    const operation: FileOperation = {
+      kind,
+      from: this.relative(src),
+      to: dst && this.relative(dst),
+      isDir,
+      files: files.slice(0, MAX_OPERATION_FILES_SHOWN),
+      totalFiles: files.length,
+    };
+    const what = operation.to ? `${operation.from} → ${operation.to}` : operation.from;
+    if (!(await this.confirmOperation(operation, this.signal, this.owner))) {
+      return `Пользователь отклонил: ${verb.toLowerCase()} ${what}.`;
+    }
+    // Пока пользователь решал, файлы могли измениться
+    if (!(await this.exists(src))) return `${verb} не выполнено: ${operation.from} исчез, пока пользователь решал.`;
+    if (dst && (await this.exists(dst))) return `${verb} не выполнено: ${operation.to} появился, пока пользователь решал.`;
+
+    switch (kind) {
+      case 'move': {
+        await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(dst!.fsPath)));
+        // WorkspaceEdit, а не fs.rename: открытые вкладки переезжают вместе с файлом
+        const edit = new vscode.WorkspaceEdit();
+        edit.renameFile(src, dst!, { overwrite: false });
+        if (!(await vscode.workspace.applyEdit(edit))) throw new Error('VS Code не выполнил перенос');
+        // Ссылки на старый путь ищем сами: подсказка «найди через @search» стоила модели 5–8 лишних раундов
+        return `Перенесено: ${what}. ${await this.describeReferences(operation.from)}`;
+      }
+      case 'copy':
+        await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(dst!.fsPath)));
+        await vscode.workspace.fs.copy(src, dst!, { overwrite: false });
+        return `Скопировано: ${what}.`;
+      case 'delete':
+        await vscode.workspace.fs.delete(src, { recursive: true, useTrash: true });
+        return `Удалено в корзину: ${what}.`;
+    }
+  }
+
+  /** Есть ли в текстовых файлах проекта упоминания старого пути (после переноса) */
+  private async describeReferences(oldRel: string): Promise<string> {
+    const hits: string[] = [];
+    for (const file of await this.collectFiles(undefined, MAX_SEARCH_FILES)) {
+      if (hits.length >= 10) break;
+      try {
+        if ((await vscode.workspace.fs.stat(file)).size > MAX_SEARCH_FILE_BYTES) continue;
+        if ((await this.readText(file)).includes(oldRel)) hits.push(this.relative(file));
+      } catch {
+        // бинарный или нечитаемый файл
+      }
+    }
+    return hits.length === 0
+      ? 'Упоминаний старого пути в файлах проекта нет.'
+      : `Старый путь «${oldRel}» упоминается в: ${hits.join(', ')} — предложи пользователю обновить эти ссылки.`;
+  }
+
+  /** Все файлы внутри папки (включая игнорируемые git — переносятся и они), пути от корня */
+  private async filesUnder(dir: vscode.Uri): Promise<string[]> {
+    const found: string[] = [];
+    const walk = async (uri: vscode.Uri) => {
+      for (const [name, type] of await vscode.workspace.fs.readDirectory(uri)) {
+        const child = vscode.Uri.joinPath(uri, name);
+        if (type & vscode.FileType.Directory) await walk(child);
+        else found.push(this.relative(child));
+      }
+    };
+    await walk(dir);
+    return found.sort();
+  }
+
+  private async isDirectory(uri: vscode.Uri): Promise<boolean> {
+    try {
+      return Boolean((await vscode.workspace.fs.stat(uri)).type & vscode.FileType.Directory);
+    } catch {
+      return false;
+    }
   }
 
   /**

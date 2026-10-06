@@ -4,12 +4,14 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  MAX_EXISTING_RULES_CHARS,
   MAX_IMPORT_FILE_CHARS,
   MAX_IMPORT_TOTAL_CHARS,
   buildImportPrompt,
   classifyProjectFile,
   describeFile,
   importDone,
+  splitMdcFrontmatter,
   makeFoundFile,
   parseImportArgs,
   readUserFiles,
@@ -72,7 +74,8 @@ test('selectForImport: новые, изменившиеся, уже перене
   assert.deepEqual(sel.settings.map((f) => f.path), ['.claude/settings.json']);
 
   const prompt = buildImportPrompt(sel);
-  assert.ok(prompt.includes('--- CLAUDE.md (Claude Code) ---\nновое'));
+  assert.ok(prompt.includes('--- CLAUDE.md ---\nновое'));
+  assert.ok(prompt.includes('Папки .rules/ пока нет'));
   assert.ok(prompt.includes('изменился после прошлого переноса'));
   assert.ok(prompt.includes('.claude/settings.json — настройки инструмента'));
   assert.ok(prompt.includes('.cursorrules — уже перенесён'));
@@ -120,9 +123,32 @@ test('readUserFiles: только существующие непустые фа
   );
 });
 
-test('importDone: выполнено, только если записано в .rules', () => {
-  assert.ok(importDone([]));
-  assert.ok(importDone([{ kind: 'read_file', path: '.rules/git.md' }]));
-  assert.ok(importDone([{ kind: 'create_file', path: 'NAPARNIK.md' }]));
+test('importDone: запись в .rules или осознанное «нечего переносить» — выполнено; отказ — разъяснение', () => {
   assert.equal(importDone([{ kind: 'edit_file', path: '.rules/git.md' }]), undefined);
+  assert.equal(importDone([], 'Противоречия: нет\n\nПереносить нечего: только настройки ассистента.'), undefined);
+  assert.match(importDone([], 'Внешнее API предназначено для 1С:EDT…') ?? '', /выполняет расширение VS Code/);
+  // Отказ с «Противоречия:» внутри — всё равно отказ
+  assert.ok(importDone([], 'Я не могу выполнять команды, пишите на ailab@1c.ru.\n\n**Противоречия:** нет'));
+  assert.ok(importDone([], 'Анализ.\n**Противоречия:** нет\nСоздайте файлы сами.'));
+  assert.ok(importDone([{ kind: 'create_file', path: 'NAPARNIK.md' }], 'готово'));
+});
+
+test('splitMdcFrontmatter: заголовок .mdc вырезается, globs и description — в пометку', () => {
+  const { body, note } = splitMdcFrontmatter('---\ndescription: Правила BSL\nglobs: "**/*.bsl"\nalwaysApply: false\n---\n- правило\n');
+  assert.equal(body, '- правило\n');
+  assert.equal(note, 'применяется к файлам **/*.bsl: Правила BSL');
+  assert.deepEqual(splitMdcFrontmatter('- без заголовка'), { body: '- без заголовка' });
+  const prompt = buildImportPrompt(selectForImport([makeFoundFile('cursor', '.cursor/rules/bsl.mdc', '---\nglobs: *.bsl\n---\n- правило', false)], {}));
+  assert.ok(prompt.includes('--- .cursor/rules/bsl.mdc (применяется к файлам *.bsl) ---\n- правило'));
+});
+
+test('buildImportPrompt: текущие правила прикладываются, лишнее по объёму — только путём', () => {
+  const sel = selectForImport([makeFoundFile('claude', 'CLAUDE.md', '- правило', false)], {});
+  const prompt = buildImportPrompt(sel, [
+    { path: '.rules/git.md', text: '- коммиты' },
+    { path: '.rules/big.md', text: 'x'.repeat(MAX_EXISTING_RULES_CHARS) },
+  ]);
+  assert.ok(prompt.includes('--- .rules/git.md ---\n- коммиты'));
+  assert.ok(prompt.includes('Не показаны из-за объёма (прочитай через @read_file, если нужны): .rules/big.md'));
+  assert.ok(!prompt.includes('x'.repeat(100)));
 });

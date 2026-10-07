@@ -3,3 +3,4 @@ out/
 *.vsix
 .env
 CLAUDE.md
+.playwright-mcp/

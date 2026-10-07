@@ -28,15 +28,19 @@ import {
   MAX_FOLDER_FILES_READ,
   MAX_MENTION_FILE_CHARS,
   MAX_MENTION_TOTAL_CHARS,
+  attachmentLabel,
   findMentions,
   folderFiles,
   formatMentionedFiles,
   formatSelection,
+  fragmentKey,
+  parseFragment,
   pickFolderFiles,
   rankPaths,
   resolveMention,
   shortList,
   shortNames,
+  sliceLines,
   withFolders,
 } from './agent/mentions';
 
@@ -69,7 +73,27 @@ type WebviewMessage =
   | { type: 'insertCode'; code: string }
   | { type: 'mentionQuery'; query: string }
   | { type: 'addAttachment'; path: string }
-  | { type: 'removeAttachment'; path: string };
+  | { type: 'removeAttachment'; path: string }
+  | { type: 'dropUris'; uris: string[] };
+
+/** Объём одного чипа: сколько файлов и символов уйдёт модели, сколько не поместится */
+interface AttachmentStat {
+  files: number;
+  chars: number;
+  notFit: number;
+}
+
+/** Что уйдёт модели из @-упоминаний и чипов — общий расчёт для отправки и для объёма на чипах */
+interface GatheredContext {
+  block: string;
+  notes: string[];
+  /** Подписи приложенных файлов (путь или «путь (строки …)») → символов отправлено */
+  shownChars: Map<string, number>;
+  fileMentions: { token: string; path: string }[];
+  folderMentions: { token: string; path: string }[];
+  folderContents: Map<string, string[]>;
+  folderBinary: Map<string, number>;
+}
 
 /** Запрос, который выполняется в фоне — у каждого чата свой */
 interface RunningRequest {
@@ -94,9 +118,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private editorContextOff = false;
   private editorContextUri: string | undefined;
   private mentionIndex: { root: string; at: number; paths: Promise<string[]> } | undefined;
-  // Файлы и папки из проводника («Добавить в контекст Напарника») — уйдут со следующим вопросом.
-  // Пути от корня, папки — с «/» на конце, как в индексе @-упоминаний
-  private attachments: string[] = [];
+  // Номер последнего расчёта объёма чипов — устаревший результат не показываем
+  private statsSeq = 0;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -224,6 +247,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private renderCurrentChat(): void {
     this.post({ type: 'restore', history: this.chat.entries });
+    this.postAttachments();
     const run = this.running.get(this.chat.id);
     if (run) {
       this.post({ type: 'assistantStart' });
@@ -235,13 +259,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /** Файлы и папки, выделенные в проводнике, — чипы над полем ввода, уйдут со следующим вопросом */
-  async addToContext(uris: vscode.Uri[]): Promise<void> {
+  /**
+   * Файлы и папки контекста этого чата (проводник, вкладка, перетаскивание, «@», выделение) — чипы над полем ввода.
+   * Пути от корня, папки — с «/» на конце, как в индексе @-упоминаний, фрагмент — «путь#L120-180»
+   */
+  private get attachments(): string[] {
+    return this.chat.attachments ?? [];
+  }
+
+  private setAttachments(items: string[]): void {
+    this.chat.attachments = items;
+    // Чипы — часть чата: переживают переключение и перезапуск; время чата не меняем — порядок истории тот же
+    void this.history.save(this.chat, false);
+    this.postAttachments();
+  }
+
+  /** Путь от корня проекта; undefined — файл вне проекта, '' — сам корень */
+  private relativePath(uri: vscode.Uri): string | undefined {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!root || uri.scheme !== root.scheme || uri.authority !== root.authority) return undefined;
+    const rel = posix.relative(root.path, uri.path);
+    return rel.startsWith('..') ? undefined : rel;
+  }
+
+  private async showChat(): Promise<void> {
+    if (this.view) this.view.show(true);
+    else await vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
+  }
+
+  /** Файлы и папки из проводника, вкладки редактора или перетащенные в чат — чипы над полем ввода */
+  async addToContext(uris: vscode.Uri[]): Promise<void> {
     const outside: string[] = [];
     let isRoot = false;
+    const items = [...this.attachments];
     for (const uri of uris) {
-      const rel = root && uri.scheme === root.scheme && uri.authority === root.authority ? posix.relative(root.path, uri.path) : '..';
+      const rel = this.relativePath(uri) ?? '..';
       // Корень проекта целиком не прикладываем — для этого есть «Доступ к проекту»
       if (!rel) {
         isRoot = true;
@@ -256,7 +308,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         () => false,
       );
       const item = isFolder ? rel + '/' : rel;
-      if (!this.attachments.includes(item)) this.attachments.push(item);
+      if (!items.includes(item)) items.push(item);
     }
     if (outside.length) {
       void vscode.window.showWarningMessage(`Напарник прикладывает только файлы и папки внутри проекта: ${outside.join(', ')}`);
@@ -264,13 +316,64 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (isRoot) {
       void vscode.window.showWarningMessage('Весь проект не прикладывается к вопросу — включите «Доступ к проекту», и Напарник сам прочитает нужные файлы.');
     }
-    if (this.view) this.view.show(true);
-    else await vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
-    this.postAttachments();
+    await this.showChat();
+    this.setAttachments(items);
   }
 
+  /** Выделенный фрагмент файла — чип «файл:120–180»; строки читаются при отправке */
+  async addSelectionToContext(editor: vscode.TextEditor | undefined): Promise<void> {
+    if (!editor || editor.selection.isEmpty) return;
+    const rel = this.relativePath(editor.document.uri);
+    if (!rel) {
+      void vscode.window.showWarningMessage('Напарник прикладывает фрагменты только из файлов проекта — сохраните файл в папке проекта.');
+      return;
+    }
+    const { start, end } = editor.selection;
+    // Выделение до начала следующей строки — без неё
+    const last = end.character === 0 && end.line > start.line ? end.line - 1 : end.line;
+    const key = fragmentKey(rel, start.line + 1, last + 1);
+    await this.showChat();
+    if (!this.attachments.includes(key)) this.setAttachments([...this.attachments, key]);
+  }
+
+  /** Чипы сразу, объём — после подсчёта (читает файлы папок) */
   private postAttachments(): void {
-    this.post({ type: 'attachments', items: this.attachments });
+    const chat = this.chat;
+    const items = this.attachments;
+    const seq = ++this.statsSeq;
+    this.post({ type: 'attachments', items });
+    if (items.length === 0) return;
+    void this.attachmentStats(items)
+      .then((stats) => {
+        if (seq === this.statsSeq && this.chat === chat) this.post({ type: 'attachments', items, ...stats });
+      })
+      .catch(() => undefined);
+  }
+
+  /** Объём каждого чипа и всего приложенного — ровно то, что уйдёт с вопросом */
+  private async attachmentStats(items: string[]): Promise<{ stats: Record<string, AttachmentStat>; used: number; limit: number } | undefined> {
+    const ctx = await this.gatherContext('', items);
+    if (!ctx) return undefined;
+    const stats: Record<string, AttachmentStat> = {};
+    for (const { path: key } of ctx.fileMentions) {
+      const chars = ctx.shownChars.get(attachmentLabel(key));
+      stats[key] = { files: chars === undefined ? 0 : 1, chars: chars ?? 0, notFit: chars === undefined ? 1 : 0 };
+    }
+    for (const { path: folder } of ctx.folderMentions) {
+      const inside = ctx.folderContents.get(folder) ?? [];
+      let files = 0;
+      let chars = 0;
+      for (const p of inside) {
+        const c = ctx.shownChars.get(p);
+        if (c === undefined) continue;
+        files++;
+        chars += c;
+      }
+      stats[folder] = { files, chars, notFit: Math.max(0, inside.length - files - (ctx.folderBinary.get(folder) ?? 0)) };
+    }
+    let used = 0;
+    ctx.shownChars.forEach((c) => (used += c));
+    return { stats, used, limit: MAX_MENTION_TOTAL_CHARS };
   }
 
   /** Чип над полем ввода: какой файл и выделение будут приложены к следующему сообщению */
@@ -532,7 +635,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'ready':
         this.post({ type: 'commands', list: SLASH_COMMANDS });
         this.postEditorContext();
-        this.postAttachments();
         this.renderCurrentChat();
         this.postProjectState();
         await this.refreshTokenState();
@@ -558,13 +660,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.preview.resolve(msg.id, msg.accepted);
         break;
       case 'addAttachment':
-        if (msg.path && !this.attachments.includes(msg.path)) this.attachments.push(msg.path);
-        this.postAttachments();
+        if (msg.path && !this.attachments.includes(msg.path)) this.setAttachments([...this.attachments, msg.path]);
         break;
       case 'removeAttachment':
-        this.attachments = this.attachments.filter((p) => p !== msg.path);
-        this.postAttachments();
+        this.setAttachments(this.attachments.filter((p) => p !== msg.path));
         break;
+      case 'dropUris': {
+        const uris = (msg.uris ?? []).flatMap((u) => {
+          try {
+            return [vscode.Uri.parse(u, true)];
+          } catch {
+            return [];
+          }
+        });
+        if (uris.length) await this.addToContext(uris);
+        break;
+      }
       case 'toggleEditorContext':
         this.editorContextOff = !this.editorContextOff;
         this.postEditorContext();
@@ -615,7 +726,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const useEditor = withEditorContext === 'force' || (withEditorContext && !this.editorContextOff);
     const editorSnap = useEditor ? this.editorContext.snapshot() : undefined;
     // @-упоминания и чипы — только к вопросу пользователя, не к развёрнутым инструкциям /init и /import.
-    // Чипы остаются после отправки, пока пользователь не уберёт их сам
+    // Чипы остаются после отправки, пока пользователь не уберёт их сам; у каждого чата свои
     const attached = modelText === undefined ? [...this.attachments] : [];
     const mentioned = modelText === undefined ? await this.resolveMentions(text, attached) : undefined;
     const context = [editorSnap ? contextLabel(editorSnap) : undefined, mentioned?.label].filter(Boolean).join(' · ') || undefined;
@@ -757,18 +868,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return paths;
   }
 
-  /** Файлы и папки, упомянутые в вопросе через @ или выбранные в проводнике, — блок для модели и подпись под сообщением */
+  /** Файлы и папки, упомянутые в вопросе через @, и чипы — блок для модели, перечень выбранного и подпись под сообщением */
   private async resolveMentions(text: string, attached: string[] = []): Promise<{ block: string; selection: string; label: string } | undefined> {
+    const ctx = await this.gatherContext(text, attached);
+    if (!ctx) return undefined;
+    if (ctx.notes.length) this.info(`Упоминания: ${ctx.notes.join('; ')}.`);
+    if (!ctx.block) return undefined;
+    const isShown = (key: string) => ctx.shownChars.has(attachmentLabel(key));
+    const shown = [
+      ...ctx.fileMentions.filter((m) => isShown(m.path)).map((m) => m.path),
+      ...ctx.folderMentions.filter((m) => ctx.folderContents.get(m.path)!.some(isShown)).map((m) => m.path),
+    ];
+    const unique = [...new Set(shown)];
+    const names = shortNames(unique.map((key) => parseFragment(key)?.path ?? key)).map((name, i) => {
+      const f = parseFragment(unique[i]);
+      return '@' + name + (f ? `:${f.from}–${f.to}` : '');
+    });
+    return { block: ctx.block, selection: formatSelection(unique), label: names.join(', ') };
+  }
+
+  /** Читает упомянутое и приложенное и раскладывает по лимитам — как уйдёт модели */
+  private async gatherContext(text: string, attached: string[]): Promise<GatheredContext | undefined> {
     const tokens = findMentions(text);
     const tools = tokens.length + attached.length > 0 ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm) : undefined;
     if (!tools) return undefined;
     const paths = await this.mentionPaths(tools);
-    const files: { path: string; text: string }[] = [];
+    const files: { path: string; text: string; label?: string }[] = [];
     const notRead: string[] = [];
     const notes: string[] = [];
     const fileMentions: { token: string; path: string }[] = [];
     const folderMentions: { token: string; path: string }[] = [];
-    // Выбранное в проводнике — уже точные пути; файл может быть и скрыт .gitignore, раз его выбрали явно
+    // Чипы — уже точные пути (фрагмент — «путь#L…»); файл может быть и скрыт .gitignore, раз его выбрали явно
     for (const item of attached) (item.endsWith('/') ? folderMentions : fileMentions).push({ token: item, path: item });
     for (const token of tokens) {
       const found = resolveMention(token, paths);
@@ -780,18 +910,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         notes.push(`\`@${token}\` — файл или папка не найдены`);
       }
     }
-    // Явно упомянутые файлы важнее файлов папок — они первыми, папкам остаётся остаток лимита
-    for (const { token, path } of fileMentions) {
-      if (files.some((f) => f.path === path)) continue;
+    // Явно упомянутые файлы и фрагменты важнее файлов папок — они первыми, папкам остаётся остаток лимита
+    for (const { token, path: key } of fileMentions) {
+      const label = attachmentLabel(key);
+      if (files.some((f) => (f.label ?? f.path) === label)) continue;
+      const fragment = parseFragment(key);
+      const path = fragment?.path ?? key;
       const content = await tools.readFileText(path).catch(() => undefined);
-      if (content === undefined) notes.push(`\`@${token}\` — не удалось прочитать (двоичный файл?)`);
+      if (content === undefined) notes.push(`\`@${token}\` — не удалось прочитать (файл удалён или двоичный?)`);
+      // Файл укоротился после выделения — пустой фрагмент модели не шлём
+      else if (fragment && content.split('\n').length < fragment.from) notes.push(`\`${label}\` — в файле больше нет этих строк`);
+      else if (fragment) files.push({ path, text: sliceLines(content, fragment.from, fragment.to), label });
       else files.push({ path, text: content });
     }
     const used = files.reduce((sum, f) => sum + Math.min(f.text.length, MAX_MENTION_FILE_CHARS), 0);
     const folderContents = new Map<string, string[]>();
+    const folderBinary = new Map<string, number>();
     const candidates: { path: string; text: string }[] = [];
     // Папки могут пересекаться («@src/» и «@src/cf/») — один файл берём один раз; Set — в папке бывают десятки тысяч файлов
-    const seen = new Set(files.map((f) => f.path));
+    const seen = new Set(files.filter((f) => !f.label).map((f) => f.path));
     let reads = 0;
     for (const { token, path: folder } of folderMentions) {
       const inside = folderFiles(folder, paths);
@@ -810,6 +947,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (content === undefined) binary++;
         else candidates.push({ path, text: content });
       }
+      folderBinary.set(folder, binary);
       if (binary) notes.push(`\`@${token}\` — пропущено двоичных файлов: ${binary}`);
     }
     const { picked, skipped: notFit } = pickFolderFiles(candidates, MAX_MENTION_TOTAL_CHARS - used);
@@ -819,17 +957,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (skipped.length) {
       notes.push(`не приложены из-за объёма (${skipped.length}): ${shortList(skipped.map((p) => `\`${p}\``), 10)}`);
     }
-    if (notes.length) this.info(`Упоминания: ${notes.join('; ')}.`);
-    if (!block) return undefined;
     const notAttached = new Set(skipped);
-    const shownPaths = new Set(files.map((f) => f.path).filter((p) => !notAttached.has(p)));
-    const isShown = (path: string) => shownPaths.has(path);
-    const shown = [
-      ...fileMentions.filter((m) => isShown(m.path)).map((m) => m.path),
-      ...folderMentions.filter((m) => folderContents.get(m.path)!.some(isShown)).map((m) => m.path),
-    ];
-    const unique = [...new Set(shown)];
-    return { block, selection: formatSelection(unique), label: shortNames(unique).map((name) => '@' + name).join(', ') };
+    const shownChars = new Map<string, number>();
+    for (const f of files) {
+      const name = f.label ?? f.path;
+      if (!notAttached.has(name)) shownChars.set(name, Math.min(f.text.length, MAX_MENTION_FILE_CHARS));
+    }
+    return { block, notes, shownChars, fileMentions, folderMentions, folderContents, folderBinary };
   }
 
   /** Ответ пришёл в чат, который пользователь сейчас не видит, — сообщаем */

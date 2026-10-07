@@ -21,6 +21,8 @@ export interface SavedChat {
   lastEditorContext?: string;
   /** Хеш последнего отправленного блока приложенных файлов — чипы остаются, неизменённое повторно не шлём */
   lastAttachments?: string;
+  /** Чипы контекста этого чата — пути от корня, папки с «/», фрагменты «путь#L120-180» */
+  attachments?: string[];
   /** Модели уже отправлена инструкция по командам работы с проектом */
   agentPrimed?: boolean;
   /** Доступ к проекту выключили после инструкции — модели уже сказано не использовать команды */
@@ -40,11 +42,12 @@ export class ChatHistory {
     return [...this.state.get<SavedChat[]>(STORAGE_KEY, [])].sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
-  async save(chat: SavedChat): Promise<void> {
+  /** touch = false — сохранить без смены времени (например, изменились только чипы), порядок истории тот же */
+  async save(chat: SavedChat, touch = true): Promise<void> {
     if (chat.entries.length === 0) {
       return; // пустые чаты не храним
     }
-    chat.updatedAt = Date.now();
+    if (touch) chat.updatedAt = Date.now();
     const others = this.list().filter((c) => c.id !== chat.id);
     await this.state.update(STORAGE_KEY, [chat, ...others].slice(0, MAX_CHATS));
   }

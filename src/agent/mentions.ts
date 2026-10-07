@@ -12,6 +12,28 @@ const MAX_SKIPPED_LISTED = 200;
 // Сколько файлов одной папки читать, выбирая поместившиеся, — дальше только список
 export const MAX_FOLDER_FILES_READ = 500;
 
+/** Фрагмент файла в чипе — «путь#L120-180» (строки с 1, включительно) */
+export function fragmentKey(path: string, from: number, to: number): string {
+  return `${path}#L${from}-${to}`;
+}
+
+export function parseFragment(key: string): { path: string; from: number; to: number } | undefined {
+  const m = key.match(/^(.+)#L(\d+)-(\d+)$/);
+  return m ? { path: m[1], from: Number(m[2]), to: Number(m[3]) } : undefined;
+}
+
+/** Строки from..to (с 1) — переводы строк файла сохраняются, CRLF тоже */
+export function sliceLines(text: string, from: number, to: number): string {
+  // \r в конце — остаток CRLF последней строки фрагмента
+  return text.split('\n').slice(from - 1, to).join('\n').replace(/\r$/, '');
+}
+
+/** Подпись чипа для модели: фрагмент — «a.bsl (строки 120–180)», остальное — путь как есть */
+export function attachmentLabel(key: string): string {
+  const f = parseFragment(key);
+  return f ? `${f.path} (строки ${f.from}–${f.to})` : key;
+}
+
 /** Упоминания из текста вопроса, по порядку, без повторов */
 export function findMentions(text: string): string[] {
   const found: string[] = [];
@@ -117,7 +139,7 @@ export function rankPaths(query: string, paths: string[], limit = 30): string[] 
  * notRead — файлы папок, которые не приложены (не поместились или не читались)
  */
 export function formatMentionedFiles(
-  files: { path: string; text: string }[],
+  files: { path: string; text: string; label?: string }[],
   notRead: string[] = [],
 ): { text: string; skipped: string[] } {
   const parts: string[] = [];
@@ -126,16 +148,17 @@ export function formatMentionedFiles(
   let total = 0;
   for (const f of files) {
     const shown = f.text.slice(0, MAX_MENTION_FILE_CHARS);
+    const name = f.label ?? f.path;
     if (total + shown.length > MAX_MENTION_TOTAL_CHARS) {
-      skipped.push(f.path);
+      skipped.push(name);
       continue;
     }
     total += shown.length;
     const note = shown.length < f.text.length ? ` (показаны первые ${shown.length} символов из ${f.text.length})` : '';
     const ext = f.path.match(/\.(\w+)$/)?.[1].toLowerCase() ?? '';
     const lang = ext === 'os' ? 'bsl' : ext;
-    attached.push(f.path);
-    parts.push(`--- ${f.path}${note} ---\n\`\`\`${lang}\n${shown}\n\`\`\``);
+    attached.push(name);
+    parts.push(`--- ${name}${note} ---\n\`\`\`${lang}\n${shown}\n\`\`\``);
   }
   skipped = skipped.concat(notRead); // не push(...): список папки бывает огромным
   const text =
@@ -144,7 +167,11 @@ export function formatMentionedFiles(
       : // Перечень в начале: после длинных файлов модель теряла последний (живой API, 5 файлов — 4 в 5 прогонах из 6)
         `[Файлы, приложенные пользователем к вопросу (${attached.length}): ${shortList(attached, MAX_SKIPPED_LISTED)}. ` +
         `Содержимое каждого — ниже, повторно их не читай]\n${parts.join('\n\n')}` +
-        (skipped.length ? `\n\nНе приложены из-за объёма: ${shortList(skipped, MAX_SKIPPED_LISTED)}` : '');
+        // Число и «содержимого нет» — без них на большой папке модель путала, сколько файлов видит (живой API: 2 из 6 верно)
+        (skipped.length
+          ? `\n\n[Не приложены из-за объёма — ещё ${skipped.length} файл(ов), их содержимого в сообщении нет. ` +
+            `Приложено с содержимым — ${attached.length}. Не приложенные: ${shortList(skipped, MAX_SKIPPED_LISTED)}]`
+          : '');
   return { text, skipped };
 }
 
@@ -158,7 +185,7 @@ export function formatSelection(paths: string[]): string {
   const files = paths.filter((p) => !p.endsWith('/'));
   const parts = [
     folders.length ? `папки (${folders.length}): ${shortList(folders, MAX_SKIPPED_LISTED)}` : '',
-    files.length ? `файлы (${files.length}): ${shortList(files, MAX_SKIPPED_LISTED)}` : '',
+    files.length ? `файлы (${files.length}): ${shortList(files.map(attachmentLabel), MAX_SKIPPED_LISTED)}` : '',
   ].filter(Boolean);
   // «Не вложенные» — на «какие папки в контексте» модель перечисляла подпапки приложенной
   return (

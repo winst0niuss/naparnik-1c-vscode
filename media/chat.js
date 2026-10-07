@@ -220,20 +220,99 @@
     return own.slice(-n).join('/') + (p.endsWith('/') ? '/' : '');
   }
 
-  /** Чипы файлов и папок (из проводника и выбранные по «@»): уйдут со следующим вопросом, клик — убрать */
-  function renderAttachments(items) {
+  /** «48 тыс.» — объём в символах коротко */
+  function formatChars(n) {
+    return n >= 1000 ? Math.round(n / 1000) + ' тыс.' : String(n);
+  }
+
+  /** Фрагмент файла в чипе — «путь#L120-180» */
+  function parseFragment(key) {
+    const m = key.match(/^(.+)#L(\d+)-(\d+)$/);
+    return m ? { path: m[1], from: m[2], to: m[3] } : null;
+  }
+
+  /**
+   * Чипы контекста этого чата: уходят с каждым вопросом, клик — убрать.
+   * stats приходят вторым сообщением, когда расширение посчитало объём; used/limit — сводка по всем
+   */
+  function renderAttachments(items, stats, used, limit) {
     attachmentsEl.innerHTML = '';
-    for (const p of items) {
-      const isFolder = p.endsWith('/');
+    const paths = items.map((key) => (parseFragment(key) || { path: key }).path);
+    items.forEach((key, i) => {
+      const fragment = parseFragment(key);
+      const isFolder = key.endsWith('/');
+      const st = stats && stats[key];
       const chip = document.createElement('button');
       chip.type = 'button';
-      chip.className = 'chip';
-      chip.dataset.path = p;
-      chip.textContent = (isFolder ? '📁 ' : '📄 ') + shortName(p, items) + ' ✕';
-      chip.title = p + ' — будет приложен к вопросу. Нажмите, чтобы убрать';
+      chip.className = 'chip' + (st && st.notFit ? ' warn' : '');
+      chip.dataset.path = key;
+      const name = shortName(paths[i], paths) + (fragment ? ':' + fragment.from + '–' + fragment.to : '');
+      chip.textContent = (isFolder ? '📁 ' : fragment ? '✂️ ' : '📄 ') + name + ' ✕';
+      let size = '';
+      if (st && isFolder) {
+        size = st.files + ' файл(ов), ' + formatChars(st.chars) + ' символов' + (st.notFit ? '; не поместились: ' + st.notFit : '');
+      } else if (st) {
+        size = st.notFit ? 'не помещается в лимит' : formatChars(st.chars) + ' символов';
+      }
+      const where = fragment ? fragment.path + ', строки ' + fragment.from + '–' + fragment.to : key;
+      chip.title = where + (size ? ' — ' + size : '') + '. Прикладывается к каждому вопросу. Нажмите, чтобы убрать';
       attachmentsEl.appendChild(chip);
+    });
+    // Сводка: сколько занято из лимита на всё приложенное к сообщению
+    if (items.length && limit) {
+      const summary = document.createElement('span');
+      const over = Object.values(stats || {}).some((st) => st.notFit);
+      summary.className = 'attachments-summary' + (over ? ' warn' : '');
+      summary.textContent = formatChars(used) + ' / ' + formatChars(limit);
+      summary.title = over
+        ? 'Приложенное не помещается целиком — часть файлов не уйдёт. Наведите на чип, чтобы увидеть, что не поместилось'
+        : 'Символов приложено к вопросу из лимита на одно сообщение';
+      attachmentsEl.appendChild(summary);
     }
   }
+
+  // Перетаскивание файлов и папок из проводника или вкладок редактора — в контекст
+  const DROP_TYPES = ['application/vnd.code.uri-list', 'text/uri-list', 'resourceurls', 'codeeditors'];
+  const hasDropData = (e) => Array.from(e.dataTransfer ? e.dataTransfer.types : []).some((t) => DROP_TYPES.includes(t.toLowerCase()));
+
+  /** URI из перетаскивания: списки URI, ResourceURLs (JSON-массив строк), CodeEditors (вкладки) */
+  function droppedUris(dt) {
+    const uriList = dt.getData('application/vnd.code.uri-list') || dt.getData('text/uri-list');
+    if (uriList) {
+      return uriList.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+    }
+    const parse = (type) => {
+      try {
+        return JSON.parse(dt.getData(type) || '[]');
+      } catch {
+        return [];
+      }
+    };
+    const urls = parse('ResourceURLs').filter((u) => typeof u === 'string');
+    if (urls.length) return urls;
+    return parse('CodeEditors')
+      .map((ed) => ed && ed.resource)
+      .map((r) => (typeof r === 'string' ? r : r && r.scheme && r.path ? r.scheme + '://' + (r.authority || '') + r.path : ''))
+      .filter(Boolean);
+  }
+
+  form.addEventListener('dragover', (e) => {
+    if (!hasDropData(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    form.classList.add('drop-target');
+  });
+  form.addEventListener('dragleave', (e) => {
+    if (!form.contains(e.relatedTarget)) form.classList.remove('drop-target');
+  });
+  form.addEventListener('drop', (e) => {
+    form.classList.remove('drop-target');
+    const uris = droppedUris(e.dataTransfer);
+    if (!uris.length) return;
+    e.preventDefault();
+    vscode.postMessage({ type: 'dropUris', uris });
+  });
+
   document.getElementById('set-token').addEventListener('click', () => vscode.postMessage({ type: 'setToken' }));
 
   // Кнопки у блоков кода — через делегирование, блоки создаются динамически
@@ -277,7 +356,7 @@
           : 'Файл не прикладывается. Нажмите, чтобы приложить';
         break;
       case 'attachments':
-        renderAttachments(msg.items || []);
+        renderAttachments(msg.items || [], msg.stats, msg.used, msg.limit);
         break;
       case 'commands':
         commands = msg.list || [];

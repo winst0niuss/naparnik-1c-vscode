@@ -3,14 +3,18 @@ import * as assert from 'node:assert/strict';
 import {
   MAX_MENTION_FILE_CHARS,
   MAX_MENTION_TOTAL_CHARS,
+  attachmentLabel,
   findMentions,
   folderFiles,
   formatMentionedFiles,
   formatSelection,
+  fragmentKey,
+  parseFragment,
   pickFolderFiles,
   rankPaths,
   resolveMention,
   shortNames,
+  sliceLines,
   withFolders,
 } from '../agent/mentions';
 
@@ -121,4 +125,22 @@ test('formatSelection: папки и файлы, выбранные пользо
   assert.ok(text.includes('файлы (1): a.bsl'));
   assert.ok(text.includes('файлы папок приложены выше'));
   assert.ok(!formatSelection(['a.bsl']).includes('папк'));
+});
+
+test('фрагмент файла: ключ, разбор, строки с сохранением CRLF, подпись для модели', () => {
+  const key = fragmentKey('src/a.bsl', 2, 3);
+  assert.equal(key, 'src/a.bsl#L2-3');
+  assert.deepEqual(parseFragment(key), { path: 'src/a.bsl', from: 2, to: 3 });
+  assert.equal(parseFragment('src/a.bsl'), undefined);
+  assert.equal(parseFragment('src/'), undefined);
+  assert.equal(sliceLines('a\r\nb\r\nc\r\nd', 2, 3), 'b\r\nc');
+  assert.equal(attachmentLabel(key), 'src/a.bsl (строки 2–3)');
+  assert.equal(attachmentLabel('src/'), 'src/');
+  assert.ok(formatSelection([key]).includes('файлы (1): src/a.bsl (строки 2–3)'));
+});
+
+test('formatMentionedFiles: фрагмент — с подписью, язык по пути файла', () => {
+  const { text } = formatMentionedFiles([{ path: 'a.bsl', text: 'А = 1;', label: 'a.bsl (строки 5–5)' }]);
+  assert.ok(text.includes('(1): a.bsl (строки 5–5).'));
+  assert.ok(text.includes('--- a.bsl (строки 5–5) ---\n```bsl\nА = 1;'));
 });

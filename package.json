@@ -79,6 +79,11 @@
         "category": "1С:Напарник"
       },
       {
+        "command": "naparnik.addSelectionToContext",
+        "title": "Добавить выделенное в контекст Напарника",
+        "category": "1С:Напарник"
+      },
+      {
         "command": "naparnik.applyEdit",
         "title": "Применить правку Напарника",
         "category": "1С:Напарник",
@@ -120,6 +125,18 @@
           "command": "naparnik.askAboutSelection",
           "when": "editorHasSelection",
           "group": "navigation"
+        },
+        {
+          "command": "naparnik.addSelectionToContext",
+          "when": "editorHasSelection",
+          "group": "navigation"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "naparnik.addToContext",
+          "when": "resourceScheme == file",
+          "group": "naparnik@1"
         }
       ],
       "editor/title": [
@@ -138,6 +155,10 @@
         {
           "command": "naparnik.addToContext",
           "when": "false"
+        },
+        {
+          "command": "naparnik.addSelectionToContext",
+          "when": "editorHasSelection"
         },
         {
           "command": "naparnik.applyEdit",

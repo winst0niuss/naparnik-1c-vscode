@@ -174,16 +174,19 @@
     else chooseCommand(item, run);
   }
 
-  /** Заменить «@часть» перед курсором полным путём файла или папки; путь с пробелами — в кавычках */
+  /** Выбранный файл или папка уходит в чипы над полем ввода, а «@часть» перед курсором убирается из текста */
   function insertMention(item) {
     if (!item) return;
     hideMenu();
     const caret = input.selectionStart;
-    const token = /\s/.test(item.path) ? '@"' + item.path + '" ' : '@' + item.path + ' ';
-    const before = input.value.slice(0, caret).replace(/@[^\s"]*$/, token);
-    input.value = before + input.value.slice(caret);
+    const before = input.value.slice(0, caret).replace(/@[^\s"]*$/, '');
+    let after = input.value.slice(caret);
+    // Не оставляем двойной пробел на месте упоминания
+    if ((before === '' || /\s$/.test(before)) && /^ /.test(after)) after = after.slice(1);
+    input.value = before + after;
     input.setSelectionRange(before.length, before.length);
     mentionQuery = null;
+    vscode.postMessage({ type: 'addAttachment', path: item.path });
     input.focus();
   }
 
@@ -217,7 +220,7 @@
     return own.slice(-n).join('/') + (p.endsWith('/') ? '/' : '');
   }
 
-  /** Чипы файлов и папок из проводника: уйдут со следующим вопросом, клик — убрать */
+  /** Чипы файлов и папок (из проводника и выбранные по «@»): уйдут со следующим вопросом, клик — убрать */
   function renderAttachments(items) {
     attachmentsEl.innerHTML = '';
     for (const p of items) {

@@ -67,6 +67,7 @@ type WebviewMessage =
   | { type: 'toggleEditorContext' }
   | { type: 'insertCode'; code: string }
   | { type: 'mentionQuery'; query: string }
+  | { type: 'addAttachment'; path: string }
   | { type: 'removeAttachment'; path: string };
 
 /** Запрос, который выполняется в фоне — у каждого чата свой */
@@ -555,6 +556,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'resolveEdit':
         this.preview.resolve(msg.id, msg.accepted);
         break;
+      case 'addAttachment':
+        if (msg.path && !this.attachments.includes(msg.path)) this.attachments.push(msg.path);
+        this.postAttachments();
+        break;
       case 'removeAttachment':
         this.attachments = this.attachments.filter((p) => p !== msg.path);
         this.postAttachments();
@@ -869,7 +874,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <button type="button" id="editor-chip" class="chip hidden" title=""></button>
     </div>
     <div id="slash-menu" class="slash-menu hidden" role="listbox"></div>
-    <textarea id="input" rows="3" placeholder="Задай мне вопрос… «/» — команды, «@» — файл или папка проекта&#10;Enter — отправить, Shift+Enter — новая строка"></textarea>
+    <textarea id="input" rows="3" placeholder="Задай мне вопрос… «/» — команды, «@» — файл или папка проекта&#10;Файлы из проводника — правый клик → «Добавить в контекст Напарника»&#10;Enter — отправить, Shift+Enter — новая строка"></textarea>
     <div class="actions">
       <button type="button" id="stop" class="secondary hidden">Стоп</button>
       <button type="submit" id="send">Отправить</button>

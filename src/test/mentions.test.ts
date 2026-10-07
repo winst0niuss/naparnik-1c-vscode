@@ -48,6 +48,9 @@ test('formatMentionedFiles: язык по расширению, обрезка �
   const { text } = formatMentionedFiles([{ path: 'a.bsl', text: 'Процедура А()\nКонецПроцедуры' }]);
   assert.ok(text.includes('--- a.bsl ---\n```bsl\nПроцедура А()'));
   assert.ok(text.includes('повторно их не читай'));
+  // Перечень приложенных — в начале блока: модель теряла последний файл после длинных
+  const two = formatMentionedFiles([{ path: 'a.bsl', text: 'x'.repeat(500) }, { path: 'b.json', text: '{}' }]).text;
+  assert.ok(two.startsWith('[Файлы, которые пользователь упомянул в вопросе (2): a.bsl, b.json.'));
   const big = 'x'.repeat(MAX_MENTION_FILE_CHARS + 10);
   assert.ok(formatMentionedFiles([{ path: 'b.txt', text: big }]).text.includes(`показаны первые ${MAX_MENTION_FILE_CHARS} символов`));
   const many = Array.from({ length: Math.ceil(MAX_MENTION_TOTAL_CHARS / MAX_MENTION_FILE_CHARS) + 1 }, (_, i) => ({ path: `f${i}.txt`, text: big }));

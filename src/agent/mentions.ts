@@ -121,6 +121,7 @@ export function formatMentionedFiles(
   notRead: string[] = [],
 ): { text: string; skipped: string[] } {
   const parts: string[] = [];
+  const attached: string[] = [];
   let skipped: string[] = [];
   let total = 0;
   for (const f of files) {
@@ -133,13 +134,16 @@ export function formatMentionedFiles(
     const note = shown.length < f.text.length ? ` (показаны первые ${shown.length} символов из ${f.text.length})` : '';
     const ext = f.path.match(/\.(\w+)$/)?.[1].toLowerCase() ?? '';
     const lang = ext === 'os' ? 'bsl' : ext;
+    attached.push(f.path);
     parts.push(`--- ${f.path}${note} ---\n\`\`\`${lang}\n${shown}\n\`\`\``);
   }
   skipped = skipped.concat(notRead); // не push(...): список папки бывает огромным
   const text =
     parts.length === 0
       ? ''
-      : `[Файлы, которые пользователь упомянул в вопросе, — содержимое уже здесь, повторно их не читай]\n${parts.join('\n\n')}` +
+      : // Перечень в начале: после длинных файлов модель теряла последний (живой API, 5 файлов — 4 в 5 прогонах из 6)
+        `[Файлы, которые пользователь упомянул в вопросе (${attached.length}): ${shortList(attached, MAX_SKIPPED_LISTED)}. ` +
+        `Содержимое каждого — ниже, повторно их не читай]\n${parts.join('\n\n')}` +
         (skipped.length ? `\n\nНе приложены из-за объёма: ${shortList(skipped, MAX_SKIPPED_LISTED)}` : '');
   return { text, skipped };
 }

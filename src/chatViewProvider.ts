@@ -33,6 +33,7 @@ import {
   folderFiles,
   formatMentionedFiles,
   formatSelection,
+  overflowReadHint,
   fragmentKey,
   parseFragment,
   pickFolderFiles,
@@ -43,6 +44,7 @@ import {
   sliceLines,
   withFolders,
 } from './agent/mentions';
+import { FolderReadTools } from './agent/folderReadTools';
 
 /** /init выполнен, только если NAPARNIK.md создан или изменён */
 function initDone(executed: AgentCommand[]): string | undefined {
@@ -93,6 +95,8 @@ interface GatheredContext {
   folderMentions: { token: string; path: string }[];
   folderContents: Map<string, string[]>;
   folderBinary: Map<string, number>;
+  /** Папки, файлы которых поместились не все, — их модель может дочитать */
+  overflowFolders: string[];
 }
 
 /** Запрос, который выполняется в фоне — у каждого чата свой */
@@ -775,7 +779,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       } else if (filesHash) {
         chat.lastAttachments = filesHash;
       }
-      const question = [editorBlock, filesBlock, mentioned?.selection, modelText ?? text].filter(Boolean).join('\n\n');
+      // Папка не поместилась — модель может дочитать её сама: с доступом к проекту — любыми командами,
+      // без доступа — только чтение внутри этих папок
+      const overflow = mentioned?.overflowFolders ?? [];
+      const workspace = !tools && overflow.length ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm, run.abort.signal, chat.id, this.preview.confirmOperation) : undefined;
+      const folderTools = workspace ? new FolderReadTools(workspace, overflow) : undefined;
+      const readHint = tools || folderTools ? overflowReadHint(overflow, Boolean(tools)) : '';
+      const question = [editorBlock, filesBlock, readHint, mentioned?.selection, modelText ?? text].filter(Boolean).join('\n\n');
       let message = question;
       if (tools && !chat.agentPrimed) {
         // Первое сообщение с доступом к проекту: инструкция по командам, дерево, документация и правила
@@ -784,7 +794,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       } else if (tools && chat.agentPaused) {
         message = `(Доступ к проекту снова включён — можно использовать @-команды.)\n\n${question}`;
       } else if (!tools && chat.agentPrimed && !chat.agentPaused) {
-        message = `(Доступ к проекту сейчас выключен — не используй команды, отвечай сразу.)\n\n${question}`;
+        message = folderTools
+          ? `(Доступ к проекту сейчас выключен — из команд можно только читать приложенные папки, см. ниже.)\n\n${question}`
+          : `(Доступ к проекту сейчас выключен — не используй команды, отвечай сразу.)\n\n${question}`;
       }
       // Модель уже знает о выключенном доступе — повторять не нужно, но при включении сообщить
       chat.agentPaused = chat.agentPrimed && !tools;
@@ -795,12 +807,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         conversationId: chat.conversationId,
         parentUuid: chat.lastAssistantUuid,
         message,
-        tools,
+        tools: tools ?? folderTools,
         maxSteps,
         checkDone,
         signal: run.abort.signal,
         onText: (partial) => {
-          run.partial = chat.agentPrimed ? stripCommandsForDisplay(partial) : partial;
+          run.partial = chat.agentPrimed || folderTools ? stripCommandsForDisplay(partial) : partial;
           // Модель пишет содержимое файла — вместе с текстом передаём прогресс, чтобы показать его вместо «думает»
           const writing = chat.agentPrimed ? findUnfinishedWrite(partial) : undefined;
           postIfVisible({ type: 'assistantText', text: run.partial, writing });
@@ -869,7 +881,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Файлы и папки, упомянутые в вопросе через @, и чипы — блок для модели, перечень выбранного и подпись под сообщением */
-  private async resolveMentions(text: string, attached: string[] = []): Promise<{ block: string; selection: string; label: string } | undefined> {
+  private async resolveMentions(
+    text: string,
+    attached: string[] = [],
+  ): Promise<{ block: string; selection: string; label: string; overflowFolders: string[] } | undefined> {
     const ctx = await this.gatherContext(text, attached);
     if (!ctx) return undefined;
     if (ctx.notes.length) this.info(`Упоминания: ${ctx.notes.join('; ')}.`);
@@ -884,7 +899,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const f = parseFragment(unique[i]);
       return '@' + name + (f ? `:${f.from}–${f.to}` : '');
     });
-    return { block: ctx.block, selection: formatSelection(unique), label: names.join(', ') };
+    return { block: ctx.block, selection: formatSelection(unique), label: names.join(', '), overflowFolders: ctx.overflowFolders };
   }
 
   /** Читает упомянутое и приложенное и раскладывает по лимитам — как уйдёт модели */
@@ -963,7 +978,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const name = f.label ?? f.path;
       if (!notAttached.has(name)) shownChars.set(name, Math.min(f.text.length, MAX_MENTION_FILE_CHARS));
     }
-    return { block, notes, shownChars, fileMentions, folderMentions, folderContents, folderBinary };
+    const overflowFolders = folderMentions
+      .map((m) => m.path)
+      .filter((folder, i, all) => all.indexOf(folder) === i && folderContents.get(folder)!.some((p) => notAttached.has(p)));
+    return { block, notes, shownChars, fileMentions, folderMentions, folderContents, folderBinary, overflowFolders };
   }
 
   /** Ответ пришёл в чат, который пользователь сейчас не видит, — сообщаем */

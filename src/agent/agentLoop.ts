@@ -18,6 +18,7 @@ import {
   parseCommands,
   syntaxCheckRequest,
 } from './protocol';
+import { EDIT_COMMAND_LINE, READ_ONLY_ANSWER, READ_ONLY_CONTINUE_HINT, READ_ONLY_HINT, READ_ONLY_TEXT_TOOL_HINT } from './folderReadTools';
 
 /** То, что нужно циклу от клиента API */
 export interface AgentClient {
@@ -29,6 +30,8 @@ export interface AgentTools {
   run(cmd: AgentCommand): Promise<string>;
   /** Текст файла после правки — для проверки синтаксиса BSL. Нет метода — проверка не просится */
   readFileText?(path: string): Promise<string>;
+  /** Только чтение (приложенная папка без «Доступа к проекту») — правки не напоминаем, а отговариваем */
+  readOnly?: boolean;
 }
 
 export interface AgentLoopOptions {
@@ -125,7 +128,8 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
           ? async (call) => {
               const cmd = emulatedCommand(call);
               if (!cmd) return undefined;
-              const description = describeCommand(cmd);
+              const description =
+                tools.readOnly && !READ_COMMANDS.has(cmd.kind) ? `⛔ Недоступно без доступа к проекту: ${describeCommand(cmd)}` : describeCommand(cmd);
               opts.onStep?.(description);
               executed.push(cmd);
               return `${call.function?.name} здесь не работает — расширение выполнило его как @${cmd.kind}. Дальше используй @-команды.\n\n${await tools.run(cmd)}`;
@@ -137,20 +141,30 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     parentUuid = answer.assistantUuid;
 
     let commands = tools ? parseCommands(answer.text) : [];
-    // Правка без @edit_file — один раз напоминаем формат, а не показываем блок как ответ
-    if (tools && commands.length === 0 && looksLikeMalformedEdit(answer.text) && !formatReminded) {
+    // Правка без @edit_file — один раз напоминаем формат, а не показываем блок как ответ.
+    // В режиме только чтения формат не напоминаем: модель пишет правку снова, и она становится ответом
+    const editAttempt = looksLikeMalformedEdit(answer.text) || (tools?.readOnly && EDIT_COMMAND_LINE.test(answer.text));
+    if (tools && commands.length === 0 && editAttempt && !formatReminded) {
       formatReminded = true;
       opts.onNextRound?.();
-      message = MALFORMED_EDIT_HINT;
+      message = tools.readOnly ? READ_ONLY_HINT : MALFORMED_EDIT_HINT;
       continue;
     }
     if (commands.length === 0) {
+      // Только чтение: модель после READ_ONLY_HINT снова пишет правку — дальше напоминания только толкают её к правкам,
+      // а сырая команда стала бы ответом (живой API: 2 из 6)
+      if (tools?.readOnly && EDIT_COMMAND_LINE.test(answer.text)) {
+        return { ...answer, text: READ_ONLY_ANSWER, steps: step, finishedByLimit: finishing };
+      }
       // Ответ без команд, но задача явно не доделана — до двух напоминаний, если шаги ещё есть
       const notDone = !tools
         ? undefined
         : looksLikeTextToolCall(answer.text)
-          ? TEXT_TOOL_CALL_HINT + (syntaxRequest ? `\n\n${syntaxRequest}` : '')
-          : opts.checkDone?.(executed, answer.text) ?? (looksLikeUnfinishedIntent(answer.text) ? CONTINUE_HINT : undefined);
+          ? tools.readOnly
+            ? READ_ONLY_TEXT_TOOL_HINT
+            : TEXT_TOOL_CALL_HINT + (syntaxRequest ? `\n\n${syntaxRequest}` : '')
+          : opts.checkDone?.(executed, answer.text) ??
+            (looksLikeUnfinishedIntent(answer.text) ? (tools.readOnly ? READ_ONLY_CONTINUE_HINT : CONTINUE_HINT) : undefined);
       if (notDone && nudges < 2 && !finishing && step < maxSteps) {
         nudges++;
         opts.onNextRound?.();
@@ -172,7 +186,8 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     const results: string[] = [];
     const checks = new Map<string, string[]>(); // изменённые модули BSL → фрагменты правок
     for (const cmd of commands) {
-      const description = describeCommand(cmd);
+      const description =
+        tools?.readOnly && !READ_COMMANDS.has(cmd.kind) ? `⛔ Недоступно без доступа к проекту: ${describeCommand(cmd)}` : describeCommand(cmd);
       opts.onStep?.(description);
       const result = await tools!.run(cmd);
       results.push(`### ${description}\n${result}`);

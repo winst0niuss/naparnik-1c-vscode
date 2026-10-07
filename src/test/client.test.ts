@@ -372,3 +372,28 @@ test('зацикливание после просьбы продолжить: �
     mock.close();
   }
 });
+
+test('сервер сам закрыл вызов инструмента и отверг ответ на него (422): просим продолжить, а не падаем', async () => {
+  let messageCalls = 0;
+  const mock = await startMock((path, body) => {
+    if (path.endsWith('/conversations/')) return { json: { uuid: 'conv-1' } };
+    messageCalls++;
+    if (messageCalls === 1) {
+      return { sse: [{ role: 'assistant', uuid: 'asst-1', content: { tool_calls: [{ id: 'call-1', function: { name: 'WriteSystemFile' } }] }, finished: true }] };
+    }
+    if (body.role === 'tool') {
+      return { status: 422, json: { error: 'No tool calls found in the previous assistant message. Tool responses can only be provided for existing tool calls.' } };
+    }
+    return { sse: [{ role: 'assistant', uuid: 'asst-2', content: { content: 'Готово' }, finished: true }] };
+  });
+  try {
+    const id = await mock.client.createConversation();
+    const answer = await mock.client.sendMessage(id, 'Вопрос', undefined, { onText: () => {} });
+    assert.equal(answer.text, 'Готово');
+    const last = mock.requests[mock.requests.length - 1].body;
+    assert.equal(last.role, 'user');
+    assert.equal(last.parent_uuid, 'asst-1');
+  } finally {
+    mock.close();
+  }
+});

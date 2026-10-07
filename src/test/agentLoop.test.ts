@@ -179,3 +179,28 @@ test('вызов проверки синтаксиса текстом: напо�
   assert.ok(sent[2].includes('```bsl\nПроцедура П()\nА = 2;\nКонецПроцедур\n'), 'в напоминании — текст из файла');
   assert.ok(!sent[2].includes('КонецПроцедуры'), 'не версия модели');
 });
+
+test('только чтение: правка текстом не напоминает формат, а отговаривает; шаг изменения помечен ⛔', async () => {
+  const { client, sent } = scriptedClient(['@edit_file a.bsl // проверено', 'Изменить нельзя — включите доступ к проекту']);
+  const t = tools();
+  const steps: string[] = [];
+  const r = await runAgentLoop({ ...base, client, tools: { ...t.tools, readOnly: true }, maxSteps: 12, onStep: (d) => steps.push(d) });
+  assert.equal(r.text, 'Изменить нельзя — включите доступ к проекту');
+  assert.ok(sent[1].includes('Изменять файлы здесь нельзя'));
+
+  const second = scriptedClient(['@create_file b.bsl\nА = 1;\n@end', 'Готово']);
+  await runAgentLoop({ ...base, client: second.client, tools: { ...t.tools, readOnly: true }, maxSteps: 12, onStep: (d) => steps.push(d) });
+  assert.ok(steps.some((d) => d.startsWith('⛔ Недоступно без доступа к проекту')));
+});
+
+test('только чтение: ответ-команда изменения после напоминаний заменяется понятным текстом', async () => {
+  const { client, sent } = scriptedClient(['@edit_file a.bsl // проверено']);
+  const t = tools();
+  const r = await runAgentLoop({ ...base, client, tools: { ...t.tools, readOnly: true }, maxSteps: 12 });
+  assert.ok(r.text.includes('Включите «Доступ к проекту»'));
+  assert.ok(!sent.some((m) => m.includes('@create_file')), 'напоминания не толкают к изменениям');
+  // Выдуманная команда записи — тоже не ответ
+  const invented = scriptedClient(['@write_file a.bsl\n// проверено']);
+  const r2 = await runAgentLoop({ ...base, client: invented.client, tools: { ...t.tools, readOnly: true }, maxSteps: 12 });
+  assert.ok(r2.text.includes('Включите «Доступ к проекту»'));
+});

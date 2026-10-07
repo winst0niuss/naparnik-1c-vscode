@@ -173,7 +173,15 @@ export class NaparnikClient {
     };
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS + MAX_CONTINUE_REQUESTS; round++) {
-      const result = await this.streamRequest(conversationId, payload, callbacks, signal);
+      let result: SseParseResult;
+      try {
+        result = await this.streamRequest(conversationId, payload, callbacks, signal);
+      } catch (err) {
+        // Сервер изредка сам закрывает вызов инструмента (наблюдалось с WriteSystemFile) и отвергает наш ответ на него
+        // («No tool calls found in the previous assistant message») — просим продолжить от того же ответа
+        if (err instanceof ApiError && err.status === 422 && err.message.includes('No tool calls found') && askToContinue(lastAssistantUuid)) continue;
+        throw err;
+      }
       // Вызовы без id сервер создаёт, когда принимает текст модели за вызов инструмента
       // (например, XML-теги в ответе). Подтвердить их нельзя — считаем ответ обычным текстом.
       const accepted = result.toolCalls.filter((tc) => tc.id);

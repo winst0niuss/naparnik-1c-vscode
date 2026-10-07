@@ -10,6 +10,7 @@ import {
   formatSelection,
   fragmentKey,
   parseFragment,
+  pluralFiles,
   pickFolderFiles,
   rankPaths,
   resolveMention,
@@ -143,4 +144,10 @@ test('formatMentionedFiles: фрагмент — с подписью, язык �
   const { text } = formatMentionedFiles([{ path: 'a.bsl', text: 'А = 1;', label: 'a.bsl (строки 5–5)' }]);
   assert.ok(text.includes('(1): a.bsl (строки 5–5).'));
   assert.ok(text.includes('--- a.bsl (строки 5–5) ---\n```bsl\nА = 1;'));
+});
+
+test('pluralFiles: склонение', () => {
+  assert.deepEqual([1, 2, 5, 11, 12, 21, 22, 25, 111, 0].map(pluralFiles), [
+    '1 файл', '2 файла', '5 файлов', '11 файлов', '12 файлов', '21 файл', '22 файла', '25 файлов', '111 файлов', '0 файлов',
+  ]);
 });

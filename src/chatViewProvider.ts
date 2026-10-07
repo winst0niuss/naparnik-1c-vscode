@@ -36,10 +36,10 @@ import {
   overflowReadHint,
   fragmentKey,
   parseFragment,
+  pluralFiles,
   pickFolderFiles,
   rankPaths,
   resolveMention,
-  shortList,
   shortNames,
   sliceLines,
   withFolders,
@@ -97,6 +97,8 @@ interface GatheredContext {
   folderBinary: Map<string, number>;
   /** Папки, файлы которых поместились не все, — их модель может дочитать */
   overflowFolders: string[];
+  /** Объём каждого файла, фрагмента и папки — для чипов и сводки в чате */
+  chipStats: Record<string, AttachmentStat>;
 }
 
 /** Запрос, который выполняется в фоне — у каждого чата свой */
@@ -358,27 +360,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async attachmentStats(items: string[]): Promise<{ stats: Record<string, AttachmentStat>; used: number; limit: number } | undefined> {
     const ctx = await this.gatherContext('', items);
     if (!ctx) return undefined;
-    const stats: Record<string, AttachmentStat> = {};
-    for (const { path: key } of ctx.fileMentions) {
-      const chars = ctx.shownChars.get(attachmentLabel(key));
-      stats[key] = { files: chars === undefined ? 0 : 1, chars: chars ?? 0, notFit: chars === undefined ? 1 : 0 };
-    }
-    for (const { path: folder } of ctx.folderMentions) {
-      const inside = ctx.folderContents.get(folder) ?? [];
-      let files = 0;
-      let chars = 0;
-      for (const p of inside) {
-        const c = ctx.shownChars.get(p);
-        if (c === undefined) continue;
-        files++;
-        chars += c;
-      }
-      stats[folder] = { files, chars, notFit: Math.max(0, inside.length - files - (ctx.folderBinary.get(folder) ?? 0)) };
-    }
     let used = 0;
     ctx.shownChars.forEach((c) => (used += c));
-    return { stats, used, limit: MAX_MENTION_TOTAL_CHARS };
+    return { stats: ctx.chipStats, used, limit: MAX_MENTION_TOTAL_CHARS };
   }
+
 
   /** Чип над полем ввода: какой файл и выделение будут приложены к следующему сообщению */
   private postEditorContext(): void {
@@ -733,7 +719,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Чипы остаются после отправки, пока пользователь не уберёт их сам; у каждого чата свои
     const attached = modelText === undefined ? [...this.attachments] : [];
     const mentioned = modelText === undefined ? await this.resolveMentions(text, attached) : undefined;
-    const context = [editorSnap ? contextLabel(editorSnap) : undefined, mentioned?.label].filter(Boolean).join(' · ') || undefined;
+    const context = [editorSnap ? `📄 ${contextLabel(editorSnap)}` : undefined, mentioned?.label].filter(Boolean).join(' · ') || undefined;
 
     // Запоминаем чат: пользователь может переключиться, а ответ должен попасть сюда
     const chat = this.chat;
@@ -753,6 +739,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (this.chat === chat) this.post(message);
     };
     postIfVisible({ type: 'userMessage', text, context });
+    // Сводка о приложенном — под вопросом, к которому она относится
+    if (mentioned?.notes.length) postIfVisible({ type: 'info', text: mentioned.notes.join('\n\n') });
     postIfVisible({ type: 'assistantStart' });
 
     try {
@@ -884,22 +872,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async resolveMentions(
     text: string,
     attached: string[] = [],
-  ): Promise<{ block: string; selection: string; label: string; overflowFolders: string[] } | undefined> {
+  ): Promise<{ block: string; selection: string; label: string; overflowFolders: string[]; notes: string[] } | undefined> {
     const ctx = await this.gatherContext(text, attached);
     if (!ctx) return undefined;
-    if (ctx.notes.length) this.info(`Упоминания: ${ctx.notes.join('; ')}.`);
-    if (!ctx.block) return undefined;
     const isShown = (key: string) => ctx.shownChars.has(attachmentLabel(key));
     const shown = [
       ...ctx.fileMentions.filter((m) => isShown(m.path)).map((m) => m.path),
       ...ctx.folderMentions.filter((m) => ctx.folderContents.get(m.path)!.some(isShown)).map((m) => m.path),
     ];
     const unique = [...new Set(shown)];
+    // Подпись под вопросом: у каждого элемента своя иконка — папка, файл или фрагмент
     const names = shortNames(unique.map((key) => parseFragment(key)?.path ?? key)).map((name, i) => {
       const f = parseFragment(unique[i]);
-      return '@' + name + (f ? `:${f.from}–${f.to}` : '');
+      return f ? `✂️ ${name}:${f.from}–${f.to}` : unique[i].endsWith('/') ? `📁 ${name}` : `📄 ${name}`;
     });
-    return { block: ctx.block, selection: formatSelection(unique), label: names.join(', '), overflowFolders: ctx.overflowFolders };
+    if (!ctx.block) return { block: '', selection: '', label: '', overflowFolders: [], notes: ctx.notes };
+    return { block: ctx.block, selection: formatSelection(unique), label: names.join(', '), overflowFolders: ctx.overflowFolders, notes: ctx.notes };
   }
 
   /** Читает упомянутое и приложенное и раскладывает по лимитам — как уйдёт модели */
@@ -926,17 +914,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     // Явно упомянутые файлы и фрагменты важнее файлов папок — они первыми, папкам остаётся остаток лимита
-    for (const { token, path: key } of fileMentions) {
+    const readable = new Set<string>();
+    for (const { path: key } of fileMentions) {
       const label = attachmentLabel(key);
       if (files.some((f) => (f.label ?? f.path) === label)) continue;
       const fragment = parseFragment(key);
       const path = fragment?.path ?? key;
       const content = await tools.readFileText(path).catch(() => undefined);
-      if (content === undefined) notes.push(`\`@${token}\` — не удалось прочитать (файл удалён или двоичный?)`);
+      const name = fragment ? `✂️ ${shortNames([path])[0]}:${fragment.from}–${fragment.to}` : `📄 ${shortNames([path])[0]}`;
+      if (content === undefined) notes.push(`${name}: не удалось прочитать (файл удалён или двоичный?).`);
       // Файл укоротился после выделения — пустой фрагмент модели не шлём
-      else if (fragment && content.split('\n').length < fragment.from) notes.push(`\`${label}\` — в файле больше нет этих строк`);
+      else if (fragment && content.split('\n').length < fragment.from) notes.push(`${name}: в файле больше нет этих строк.`);
       else if (fragment) files.push({ path, text: sliceLines(content, fragment.from, fragment.to), label });
       else files.push({ path, text: content });
+      if (files.some((f) => (f.label ?? f.path) === label)) readable.add(key);
     }
     const used = files.reduce((sum, f) => sum + Math.min(f.text.length, MAX_MENTION_FILE_CHARS), 0);
     const folderContents = new Map<string, string[]>();
@@ -963,15 +954,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         else candidates.push({ path, text: content });
       }
       folderBinary.set(folder, binary);
-      if (binary) notes.push(`\`@${token}\` — пропущено двоичных файлов: ${binary}`);
     }
     const { picked, skipped: notFit } = pickFolderFiles(candidates, MAX_MENTION_TOTAL_CHARS - used);
     files.push(...picked);
     notRead.unshift(...notFit);
     const { text: block, skipped } = formatMentionedFiles(files, notRead);
-    if (skipped.length) {
-      notes.push(`не приложены из-за объёма (${skipped.length}): ${shortList(skipped.map((p) => `\`${p}\``), 10)}`);
-    }
     const notAttached = new Set(skipped);
     const shownChars = new Map<string, number>();
     for (const f of files) {
@@ -981,7 +968,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const overflowFolders = folderMentions
       .map((m) => m.path)
       .filter((folder, i, all) => all.indexOf(folder) === i && folderContents.get(folder)!.some((p) => notAttached.has(p)));
-    return { block, notes, shownChars, fileMentions, folderMentions, folderContents, folderBinary, overflowFolders };
+    const chipStats: Record<string, AttachmentStat> = {};
+    for (const { path: key } of fileMentions) {
+      const chars = shownChars.get(attachmentLabel(key));
+      chipStats[key] = { files: chars === undefined ? 0 : 1, chars: chars ?? 0, notFit: chars === undefined ? 1 : 0 };
+    }
+    for (const { path: folder } of folderMentions) {
+      const inside = folderContents.get(folder) ?? [];
+      let count = 0;
+      let chars = 0;
+      for (const p of inside) {
+        const c = shownChars.get(p);
+        if (c === undefined) continue;
+        count++;
+        chars += c;
+      }
+      chipStats[folder] = { files: count, chars, notFit: Math.max(0, inside.length - count - (folderBinary.get(folder) ?? 0)) };
+    }
+    // Сводка в чат — по строке на чип, без списка путей: он есть в подсказке чипа, а модель дочитает нужное сама
+    for (const { path: key } of [...fileMentions, ...folderMentions]) {
+      const st = chipStats[key];
+      const binary = folderBinary.get(key) ?? 0;
+      const read = readable.has(key);
+      if (key.endsWith('/')) {
+        if (!st.notFit && !binary) continue;
+        const parts = [`приложено ${pluralFiles(st.files)}`];
+        if (st.notFit) parts.push(`ещё ${st.notFit} не поместились, Напарник дочитает нужные сам`);
+        if (binary) parts.push(`пропущено двоичных: ${binary}`);
+        notes.push(`📁 ${shortNames([key])[0]}: ${parts.join(', ')}.`);
+      } else if (read && st.notFit) {
+        const f = parseFragment(key);
+        const name = shortNames([f?.path ?? key])[0] + (f ? `:${f.from}–${f.to}` : '');
+        notes.push(`${f ? '✂️' : '📄'} ${name}: не поместился в лимит, не приложен.`);
+      }
+    }
+    return { block, notes, shownChars, fileMentions, folderMentions, folderContents, folderBinary, overflowFolders, chipStats };
   }
 
   /** Ответ пришёл в чат, который пользователь сейчас не видит, — сообщаем */

@@ -234,6 +234,14 @@ export function shortNames(paths: string[]): string[] {
   });
 }
 
+/** «1 файл», «3 файла», «12 файлов» */
+export function pluralFiles(n: number): string {
+  const d = n % 10;
+  const dd = n % 100;
+  const word = d === 1 && dd !== 11 ? 'файл' : d >= 2 && d <= 4 && (dd < 12 || dd > 14) ? 'файла' : 'файлов';
+  return `${n} ${word}`;
+}
+
 /** «a, b, c … и ещё N» */
 export function shortList(items: string[], limit: number): string {
   const shown = items.slice(0, limit).join(', ');

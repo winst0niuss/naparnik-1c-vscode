@@ -570,7 +570,8 @@
     if (context) {
       const ctx = document.createElement('div');
       ctx.className = 'user-context';
-      ctx.textContent = '📄 ' + context;
+      // Новые подписи уже с иконкой у каждого элемента; старые из истории — без неё
+      ctx.textContent = /^\p{Extended_Pictographic}/u.test(context) ? context : '📄 ' + context;
       el.appendChild(ctx);
     }
   }

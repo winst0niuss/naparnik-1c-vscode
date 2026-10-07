@@ -862,11 +862,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <div id="messages"></div>
   <form id="composer">
     <div class="composer-tools">
-      <span id="attachments" class="attachments"></span>
-      <button type="button" id="editor-chip" class="chip hidden" title=""></button>
       <button type="button" id="project-toggle" class="toggle" title="Разрешить Напарнику смотреть и читать файлы открытого проекта">
         <span class="toggle-dot"></span>Доступ к проекту
       </button>
+      <span id="attachments" class="attachments"></span>
+      <button type="button" id="editor-chip" class="chip hidden" title=""></button>
     </div>
     <div id="slash-menu" class="slash-menu hidden" role="listbox"></div>
     <textarea id="input" rows="3" placeholder="Задай мне вопрос… «/» — команды, «@» — файл или папка проекта&#10;Enter — отправить, Shift+Enter — новая строка"></textarea>

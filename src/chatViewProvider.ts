@@ -879,7 +879,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <button type="button" id="editor-chip" class="chip hidden" title=""></button>
     </div>
     <div id="slash-menu" class="slash-menu hidden" role="listbox"></div>
-    <textarea id="input" rows="3" placeholder="Задай мне вопрос… «/» — команды, «@» — файл или папка проекта&#10;Файлы из проводника — правый клик → «Добавить в контекст Напарника»&#10;Enter — отправить, Shift+Enter — новая строка"></textarea>
+    <div class="input-wrap">
+      <!-- placeholder=" " — для :placeholder-shown: своя подсказка с разными размерами шрифта, нативная так не умеет -->
+      <textarea id="input" rows="3" placeholder=" " aria-label="Задай мне вопрос"></textarea>
+      <div class="input-hint" aria-hidden="true">
+        <div class="input-hint-title">Задай мне вопрос…</div>
+        <div class="input-hint-details">«/» — команды, «@» — файл или папка проекта<br>Файлы из проводника — правый клик → «Добавить в контекст Напарника»<br>Enter — отправить, Shift+Enter — новая строка</div>
+      </div>
+    </div>
     <div class="actions">
       <button type="button" id="stop" class="secondary hidden">Стоп</button>
       <button type="submit" id="send">Отправить</button>

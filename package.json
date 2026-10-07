@@ -2,7 +2,7 @@
   "name": "naparnik-1c-chat",
   "displayName": "Напарник",
   "description": "Неофициальный чат с 1С:Напарник.",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "publisher": "winst0niuss",
   "license": "MIT",
   "icon": "media/marketplace-icon.png",

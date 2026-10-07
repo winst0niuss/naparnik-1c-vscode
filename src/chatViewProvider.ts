@@ -31,6 +31,7 @@ import {
   findMentions,
   folderFiles,
   formatMentionedFiles,
+  formatSelection,
   pickFolderFiles,
   rankPaths,
   resolveMention,
@@ -613,21 +614,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Снимок редактора берём сразу: пока ждём ответа, пользователь может переключить файл
     const useEditor = withEditorContext === 'force' || (withEditorContext && !this.editorContextOff);
     const editorSnap = useEditor ? this.editorContext.snapshot() : undefined;
-    // @-упоминания — только в вопросе пользователя, не в развёрнутых инструкциях /init и /import
-    // Файлы из проводника — тоже только к вопросу пользователя; отправленные убираем из чипов
-    // Копия: пока читаются файлы, пользователь может добавить ещё — новое останется до следующего вопроса
+    // @-упоминания и чипы — только к вопросу пользователя, не к развёрнутым инструкциям /init и /import.
+    // Чипы остаются после отправки, пока пользователь не уберёт их сам
     const attached = modelText === undefined ? [...this.attachments] : [];
     const mentioned = modelText === undefined ? await this.resolveMentions(text, attached) : undefined;
-    if (attached.length) {
-      this.attachments = this.attachments.filter((p) => !attached.includes(p));
-      this.postAttachments();
-    }
     const context = [editorSnap ? contextLabel(editorSnap) : undefined, mentioned?.label].filter(Boolean).join(' · ') || undefined;
 
     // Запоминаем чат: пользователь может переключиться, а ответ должен попасть сюда
     const chat = this.chat;
     // Состояние дискуссии до запроса: после ошибки или «Стоп» продолжаем от последнего полного ответа
-    const before = { lastAssistantUuid: chat.lastAssistantUuid, agentPrimed: chat.agentPrimed, agentPaused: chat.agentPaused, lastEditorContext: chat.lastEditorContext };
+    const before = { lastAssistantUuid: chat.lastAssistantUuid, agentPrimed: chat.agentPrimed, agentPaused: chat.agentPaused, lastEditorContext: chat.lastEditorContext, lastAttachments: chat.lastAttachments };
     if (chat.entries.length === 0) {
       chat.title = makeTitle(text);
     }
@@ -660,7 +656,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       } else if (editorHash) {
         chat.lastEditorContext = editorHash;
       }
-      const question = [editorBlock, mentioned?.block, modelText ?? text].filter(Boolean).join('\n\n');
+      // Чипы остаются между вопросами — те же неизменённые файлы повторно не шлём, только перечень выбранного
+      let filesBlock = mentioned?.block ?? '';
+      const filesHash = filesBlock ? createHash('sha1').update(filesBlock).digest('hex') : undefined;
+      if (filesHash && filesHash === chat.lastAttachments) {
+        filesBlock = '[Приложенные файлы не изменились с прошлого сообщения — их содержимое выше в чате]';
+      } else if (filesHash) {
+        chat.lastAttachments = filesHash;
+      }
+      const question = [editorBlock, filesBlock, mentioned?.selection, modelText ?? text].filter(Boolean).join('\n\n');
       let message = question;
       if (tools && !chat.agentPrimed) {
         // Первое сообщение с доступом к проекту: инструкция по командам, дерево, документация и правила
@@ -728,7 +732,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       Object.assign(chat, before);
       // Сервер отверг запрос к дискуссии (не токен и не лимит частоты) — она могла испортиться, начинаем новую
       if (err instanceof ApiError && err.status >= 400 && err.status < 500 && ![401, 403, 429].includes(err.status)) {
-        Object.assign(chat, { conversationId: undefined, lastAssistantUuid: undefined, agentPrimed: false, agentPaused: false, lastEditorContext: undefined });
+        Object.assign(chat, { conversationId: undefined, lastAssistantUuid: undefined, agentPrimed: false, agentPaused: false, lastEditorContext: undefined, lastAttachments: undefined });
       }
       return false;
     } finally {
@@ -754,7 +758,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Файлы и папки, упомянутые в вопросе через @ или выбранные в проводнике, — блок для модели и подпись под сообщением */
-  private async resolveMentions(text: string, attached: string[] = []): Promise<{ block: string; label: string } | undefined> {
+  private async resolveMentions(text: string, attached: string[] = []): Promise<{ block: string; selection: string; label: string } | undefined> {
     const tokens = findMentions(text);
     const tools = tokens.length + attached.length > 0 ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm) : undefined;
     if (!tools) return undefined;
@@ -824,7 +828,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ...fileMentions.filter((m) => isShown(m.path)).map((m) => m.path),
       ...folderMentions.filter((m) => folderContents.get(m.path)!.some(isShown)).map((m) => m.path),
     ];
-    return { block, label: shortNames([...new Set(shown)]).map((name) => '@' + name).join(', ') };
+    const unique = [...new Set(shown)];
+    return { block, selection: formatSelection(unique), label: shortNames(unique).map((name) => '@' + name).join(', ') };
   }
 
   /** Ответ пришёл в чат, который пользователь сейчас не видит, — сообщаем */

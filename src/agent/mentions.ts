@@ -142,10 +142,31 @@ export function formatMentionedFiles(
     parts.length === 0
       ? ''
       : // Перечень в начале: после длинных файлов модель теряла последний (живой API, 5 файлов — 4 в 5 прогонах из 6)
-        `[Файлы, которые пользователь упомянул в вопросе (${attached.length}): ${shortList(attached, MAX_SKIPPED_LISTED)}. ` +
+        `[Файлы, приложенные пользователем к вопросу (${attached.length}): ${shortList(attached, MAX_SKIPPED_LISTED)}. ` +
         `Содержимое каждого — ниже, повторно их не читай]\n${parts.join('\n\n')}` +
         (skipped.length ? `\n\nНе приложены из-за объёма: ${shortList(skipped, MAX_SKIPPED_LISTED)}` : '');
   return { text, skipped };
+}
+
+/**
+ * Что пользователь выбрал (чипы, @-упоминания, проводник) — строкой прямо перед вопросом.
+ * Без неё модель видела только файлы и на «какие папки в контексте?» отвечала по дереву проекта
+ */
+export function formatSelection(paths: string[]): string {
+  if (paths.length === 0) return '';
+  const folders = paths.filter((p) => p.endsWith('/'));
+  const files = paths.filter((p) => !p.endsWith('/'));
+  const parts = [
+    folders.length ? `папки (${folders.length}): ${shortList(folders, MAX_SKIPPED_LISTED)}` : '',
+    files.length ? `файлы (${files.length}): ${shortList(files, MAX_SKIPPED_LISTED)}` : '',
+  ].filter(Boolean);
+  // «Не вложенные» — на «какие папки в контексте» модель перечисляла подпапки приложенной
+  return (
+    `[В контексте — то, что пользователь выделил и приложил к вопросу: ${parts.join('; ')}. ` +
+    `«Выделенные», «в контексте», «приложенные», «эти» в вопросе — именно они` +
+    (folders.length ? ', а не вложенные в них папки и не весь проект; файлы папок приложены выше' : '') +
+    ']'
+  );
 }
 
 /**

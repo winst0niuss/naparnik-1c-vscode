@@ -6,6 +6,7 @@ import {
   findMentions,
   folderFiles,
   formatMentionedFiles,
+  formatSelection,
   pickFolderFiles,
   rankPaths,
   resolveMention,
@@ -50,7 +51,7 @@ test('formatMentionedFiles: язык по расширению, обрезка �
   assert.ok(text.includes('повторно их не читай'));
   // Перечень приложенных — в начале блока: модель теряла последний файл после длинных
   const two = formatMentionedFiles([{ path: 'a.bsl', text: 'x'.repeat(500) }, { path: 'b.json', text: '{}' }]).text;
-  assert.ok(two.startsWith('[Файлы, которые пользователь упомянул в вопросе (2): a.bsl, b.json.'));
+  assert.ok(two.startsWith('[Файлы, приложенные пользователем к вопросу (2): a.bsl, b.json.'));
   const big = 'x'.repeat(MAX_MENTION_FILE_CHARS + 10);
   assert.ok(formatMentionedFiles([{ path: 'b.txt', text: big }]).text.includes(`показаны первые ${MAX_MENTION_FILE_CHARS} символов`));
   const many = Array.from({ length: Math.ceil(MAX_MENTION_TOTAL_CHARS / MAX_MENTION_FILE_CHARS) + 1 }, (_, i) => ({ path: `f${i}.txt`, text: big }));
@@ -111,4 +112,13 @@ test('shortNames: одинаковые имена файлов различаю�
     ['Склады/Ext/ObjectModule.bsl', 'Заказ/Ext/ObjectModule.bsl', 'Module.bsl', 'Заказ/'],
   );
   assert.deepEqual(shortNames(['a/x.bsl', 'x.bsl']), ['a/x.bsl', 'x.bsl']);
+});
+
+test('formatSelection: папки и файлы, выбранные пользователем, называются явно', () => {
+  assert.equal(formatSelection([]), '');
+  const text = formatSelection(['src/', '.vscode/', 'a.bsl']);
+  assert.ok(text.includes('папки (2): src/, .vscode/'));
+  assert.ok(text.includes('файлы (1): a.bsl'));
+  assert.ok(text.includes('файлы папок приложены выше'));
+  assert.ok(!formatSelection(['a.bsl']).includes('папк'));
 });

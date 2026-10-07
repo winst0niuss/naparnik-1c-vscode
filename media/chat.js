@@ -10,6 +10,7 @@
   const tokenBanner = document.getElementById('token-banner');
   const projectToggle = document.getElementById('project-toggle');
   const editorChip = document.getElementById('editor-chip');
+  const attachmentsEl = document.getElementById('attachments');
 
   // Блок ответа, который сейчас стримится
   let currentAnswer = null;
@@ -198,6 +199,38 @@
   stopBtn.addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
   projectToggle.addEventListener('click', () => vscode.postMessage({ type: 'toggleProject' }));
   editorChip.addEventListener('click', () => vscode.postMessage({ type: 'toggleEditorContext' }));
+  attachmentsEl.addEventListener('click', (e) => {
+    const chip = e.target.closest('[data-path]');
+    if (chip) vscode.postMessage({ type: 'removeAttachment', path: chip.dataset.path });
+  });
+
+  /**
+   * Имя для чипа — кратчайший хвост пути, который не совпадает с другими чипами:
+   * в 1С почти все модули называются ObjectModule.bsl / Module.bsl
+   */
+  function shortName(p, items) {
+    const parts = (q) => q.replace(/\/$/, '').split('/');
+    const own = parts(p);
+    const others = items.filter((q) => q !== p).map(parts);
+    let n = 1;
+    while (n < own.length && others.some((o) => o.slice(-n).join('/') === own.slice(-n).join('/'))) n++;
+    return own.slice(-n).join('/') + (p.endsWith('/') ? '/' : '');
+  }
+
+  /** Чипы файлов и папок из проводника: уйдут со следующим вопросом, клик — убрать */
+  function renderAttachments(items) {
+    attachmentsEl.innerHTML = '';
+    for (const p of items) {
+      const isFolder = p.endsWith('/');
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'chip';
+      chip.dataset.path = p;
+      chip.textContent = (isFolder ? '📁 ' : '📄 ') + shortName(p, items) + ' ✕';
+      chip.title = p + ' — будет приложен к вопросу. Нажмите, чтобы убрать';
+      attachmentsEl.appendChild(chip);
+    }
+  }
   document.getElementById('set-token').addEventListener('click', () => vscode.postMessage({ type: 'setToken' }));
 
   // Кнопки у блоков кода — через делегирование, блоки создаются динамически
@@ -239,6 +272,9 @@
         editorChip.title = msg.enabled
           ? 'Файл ' + msg.path + ' будет приложен к сообщению. Нажмите, чтобы не прикладывать'
           : 'Файл не прикладывается. Нажмите, чтобы приложить';
+        break;
+      case 'attachments':
+        renderAttachments(msg.items || []);
         break;
       case 'commands':
         commands = msg.list || [];

@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { createHash } from 'node:crypto';
+import { posix } from 'node:path';
 import { ApiError, NaparnikClient } from './api/client';
 import { TokenStore } from './tokenStore';
 import { ChatHistory, SavedChat, createChat, makeTitle } from './chatHistory';
@@ -34,6 +35,7 @@ import {
   rankPaths,
   resolveMention,
   shortList,
+  shortNames,
   withFolders,
 } from './agent/mentions';
 
@@ -64,7 +66,8 @@ type WebviewMessage =
   | { type: 'resolveEdit'; id: number; accepted: boolean }
   | { type: 'toggleEditorContext' }
   | { type: 'insertCode'; code: string }
-  | { type: 'mentionQuery'; query: string };
+  | { type: 'mentionQuery'; query: string }
+  | { type: 'removeAttachment'; path: string };
 
 /** Запрос, который выполняется в фоне — у каждого чата свой */
 interface RunningRequest {
@@ -89,6 +92,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private editorContextOff = false;
   private editorContextUri: string | undefined;
   private mentionIndex: { root: string; at: number; paths: Promise<string[]> } | undefined;
+  // Файлы и папки из проводника («Добавить в контекст Напарника») — уйдут со следующим вопросом.
+  // Пути от корня, папки — с «/» на конце, как в индексе @-упоминаний
+  private attachments: string[] = [];
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -225,6 +231,44 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.pendingEdits.forEach((edit) => {
       if (edit.owner === this.chat.id) this.post({ type: 'editPending', ...edit });
     });
+  }
+
+  /** Файлы и папки, выделенные в проводнике, — чипы над полем ввода, уйдут со следующим вопросом */
+  async addToContext(uris: vscode.Uri[]): Promise<void> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+    const outside: string[] = [];
+    let isRoot = false;
+    for (const uri of uris) {
+      const rel = root && uri.scheme === root.scheme && uri.authority === root.authority ? posix.relative(root.path, uri.path) : '..';
+      // Корень проекта целиком не прикладываем — для этого есть «Доступ к проекту»
+      if (!rel) {
+        isRoot = true;
+        continue;
+      }
+      if (rel.startsWith('..')) {
+        outside.push(uri.path.split('/').pop() || uri.toString());
+        continue;
+      }
+      const isFolder = await vscode.workspace.fs.stat(uri).then(
+        (st) => Boolean(st.type & vscode.FileType.Directory),
+        () => false,
+      );
+      const item = isFolder ? rel + '/' : rel;
+      if (!this.attachments.includes(item)) this.attachments.push(item);
+    }
+    if (outside.length) {
+      void vscode.window.showWarningMessage(`Напарник прикладывает только файлы и папки внутри проекта: ${outside.join(', ')}`);
+    }
+    if (isRoot) {
+      void vscode.window.showWarningMessage('Весь проект не прикладывается к вопросу — включите «Доступ к проекту», и Напарник сам прочитает нужные файлы.');
+    }
+    if (this.view) this.view.show(true);
+    else await vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
+    this.postAttachments();
+  }
+
+  private postAttachments(): void {
+    this.post({ type: 'attachments', items: this.attachments });
   }
 
   /** Чип над полем ввода: какой файл и выделение будут приложены к следующему сообщению */
@@ -486,6 +530,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'ready':
         this.post({ type: 'commands', list: SLASH_COMMANDS });
         this.postEditorContext();
+        this.postAttachments();
         this.renderCurrentChat();
         this.postProjectState();
         await this.refreshTokenState();
@@ -509,6 +554,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'resolveEdit':
         this.preview.resolve(msg.id, msg.accepted);
+        break;
+      case 'removeAttachment':
+        this.attachments = this.attachments.filter((p) => p !== msg.path);
+        this.postAttachments();
         break;
       case 'toggleEditorContext':
         this.editorContextOff = !this.editorContextOff;
@@ -560,7 +609,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const useEditor = withEditorContext === 'force' || (withEditorContext && !this.editorContextOff);
     const editorSnap = useEditor ? this.editorContext.snapshot() : undefined;
     // @-упоминания — только в вопросе пользователя, не в развёрнутых инструкциях /init и /import
-    const mentioned = modelText === undefined ? await this.resolveMentions(text) : undefined;
+    // Файлы из проводника — тоже только к вопросу пользователя; отправленные убираем из чипов
+    // Копия: пока читаются файлы, пользователь может добавить ещё — новое останется до следующего вопроса
+    const attached = modelText === undefined ? [...this.attachments] : [];
+    const mentioned = modelText === undefined ? await this.resolveMentions(text, attached) : undefined;
+    if (attached.length) {
+      this.attachments = this.attachments.filter((p) => !attached.includes(p));
+      this.postAttachments();
+    }
     const context = [editorSnap ? contextLabel(editorSnap) : undefined, mentioned?.label].filter(Boolean).join(' · ') || undefined;
 
     // Запоминаем чат: пользователь может переключиться, а ответ должен попасть сюда
@@ -692,10 +748,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return paths;
   }
 
-  /** Файлы и папки, упомянутые в вопросе через @, — блок для модели и подпись под сообщением */
-  private async resolveMentions(text: string): Promise<{ block: string; label: string } | undefined> {
+  /** Файлы и папки, упомянутые в вопросе через @ или выбранные в проводнике, — блок для модели и подпись под сообщением */
+  private async resolveMentions(text: string, attached: string[] = []): Promise<{ block: string; label: string } | undefined> {
     const tokens = findMentions(text);
-    const tools = tokens.length > 0 ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm) : undefined;
+    const tools = tokens.length + attached.length > 0 ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm) : undefined;
     if (!tools) return undefined;
     const paths = await this.mentionPaths(tools);
     const files: { path: string; text: string }[] = [];
@@ -703,6 +759,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const notes: string[] = [];
     const fileMentions: { token: string; path: string }[] = [];
     const folderMentions: { token: string; path: string }[] = [];
+    // Выбранное в проводнике — уже точные пути; файл может быть и скрыт .gitignore, раз его выбрали явно
+    for (const item of attached) (item.endsWith('/') ? folderMentions : fileMentions).push({ token: item, path: item });
     for (const token of tokens) {
       const found = resolveMention(token, paths);
       if (found && 'path' in found) (found.path.endsWith('/') ? folderMentions : fileMentions).push({ token, path: found.path });
@@ -756,14 +814,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!block) return undefined;
     const notAttached = new Set(skipped);
     const shownPaths = new Set(files.map((f) => f.path).filter((p) => !notAttached.has(p)));
-    const attached = (path: string) => shownPaths.has(path);
-    const labels = [
-      ...fileMentions.filter((m) => attached(m.path)).map((m) => '@' + m.path.split('/').pop()),
-      ...folderMentions
-        .filter((m) => folderContents.get(m.path)!.some(attached))
-        .map((m) => '@' + m.path.slice(0, -1).split('/').pop() + '/'),
+    const isShown = (path: string) => shownPaths.has(path);
+    const shown = [
+      ...fileMentions.filter((m) => isShown(m.path)).map((m) => m.path),
+      ...folderMentions.filter((m) => folderContents.get(m.path)!.some(isShown)).map((m) => m.path),
     ];
-    return { block, label: [...new Set(labels)].join(', ') };
+    return { block, label: shortNames([...new Set(shown)]).map((name) => '@' + name).join(', ') };
   }
 
   /** Ответ пришёл в чат, который пользователь сейчас не видит, — сообщаем */
@@ -806,6 +862,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <div id="messages"></div>
   <form id="composer">
     <div class="composer-tools">
+      <span id="attachments" class="attachments"></span>
       <button type="button" id="editor-chip" class="chip hidden" title=""></button>
       <button type="button" id="project-toggle" class="toggle" title="Разрешить Напарнику смотреть и читать файлы открытого проекта">
         <span class="toggle-dot"></span>Доступ к проекту

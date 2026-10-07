@@ -144,6 +144,20 @@ export function formatMentionedFiles(
   return { text, skipped };
 }
 
+/**
+ * Короткие различимые имена: кратчайший хвост пути, не совпадающий с остальными
+ * (в 1С почти все модули — ObjectModule.bsl / Module.bsl). Папка — с «/» на конце. Та же логика — у чипов в chat.js
+ */
+export function shortNames(paths: string[]): string[] {
+  const split = paths.map((p) => p.replace(/\/$/, '').split('/'));
+  return split.map((own, i) => {
+    const tail = (parts: string[], n: number) => parts.slice(-n).join('/');
+    let n = 1;
+    while (n < own.length && split.some((o, j) => j !== i && tail(o, n) === tail(own, n))) n++;
+    return tail(own, n) + (paths[i].endsWith('/') ? '/' : '');
+  });
+}
+
 /** «a, b, c … и ещё N» */
 export function shortList(items: string[], limit: number): string {
   const shown = items.slice(0, limit).join(', ');

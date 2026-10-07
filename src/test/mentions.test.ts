@@ -9,6 +9,7 @@ import {
   pickFolderFiles,
   rankPaths,
   resolveMention,
+  shortNames,
   withFolders,
 } from '../agent/mentions';
 
@@ -99,4 +100,12 @@ test('pickFolderFiles: только целиком и в пределах ост
   assert.deepEqual(r.picked.map((f) => f.path), ['f/a.bsl', 'f/c.bsl']);
   assert.deepEqual(r.skipped, ['f/Form.xml', 'f/b.bsl']);
   assert.deepEqual(pickFolderFiles([small], -5), { picked: [], skipped: ['f/c.bsl'] });
+});
+
+test('shortNames: одинаковые имена файлов различаются хвостом пути, папка — с «/»', () => {
+  assert.deepEqual(
+    shortNames(['Catalogs/Склады/Ext/ObjectModule.bsl', 'Documents/Заказ/Ext/ObjectModule.bsl', 'CommonModules/У/Ext/Module.bsl', 'Documents/Заказ/']),
+    ['Склады/Ext/ObjectModule.bsl', 'Заказ/Ext/ObjectModule.bsl', 'Module.bsl', 'Заказ/'],
+  );
+  assert.deepEqual(shortNames(['a/x.bsl', 'x.bsl']), ['a/x.bsl', 'x.bsl']);
 });

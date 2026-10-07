@@ -31,6 +31,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('naparnik.newChat', () => chat.newChat()),
     vscode.commands.registerCommand('naparnik.showHistory', () => chat.showHistory()),
     vscode.commands.registerCommand('naparnik.toggleProjectAccess', () => chat.toggleProjectAccess()),
+    // Контекстное меню проводника: VS Code передаёт файл под курсором и все выделенные
+    vscode.commands.registerCommand('naparnik.addToContext', (uri?: vscode.Uri, uris?: vscode.Uri[]) =>
+      chat.addToContext(uris?.length ? uris : uri ? [uri] : []),
+    ),
     // Кнопки ✓/✕ в заголовке вкладки с diff предложенной правки
     vscode.commands.registerCommand('naparnik.applyEdit', (uri?: vscode.Uri) => preview.resolveByUri(uri ?? activeDiffUri(), true)),
     vscode.commands.registerCommand('naparnik.rejectEdit', (uri?: vscode.Uri) => preview.resolveByUri(uri ?? activeDiffUri(), false)),

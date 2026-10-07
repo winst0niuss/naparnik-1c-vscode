@@ -74,6 +74,11 @@
         "category": "1С:Напарник"
       },
       {
+        "command": "naparnik.addToContext",
+        "title": "Добавить в контекст Напарника",
+        "category": "1С:Напарник"
+      },
+      {
         "command": "naparnik.applyEdit",
         "title": "Применить правку Напарника",
         "category": "1С:Напарник",
@@ -104,6 +109,12 @@
           "group": "navigation@3"
         }
       ],
+      "explorer/context": [
+        {
+          "command": "naparnik.addToContext",
+          "group": "naparnik@1"
+        }
+      ],
       "editor/context": [
         {
           "command": "naparnik.askAboutSelection",
@@ -124,6 +135,10 @@
         }
       ],
       "commandPalette": [
+        {
+          "command": "naparnik.addToContext",
+          "when": "false"
+        },
         {
           "command": "naparnik.applyEdit",
           "when": "resourceScheme == naparnik-proposed"

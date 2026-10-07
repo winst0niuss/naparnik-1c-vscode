@@ -23,7 +23,19 @@ import {
   scanReport,
   selectForImport,
 } from './agent/importSources';
-import { findMentions, formatMentionedFiles, rankPaths, resolveMention } from './agent/mentions';
+import {
+  MAX_FOLDER_FILES_READ,
+  MAX_MENTION_FILE_CHARS,
+  MAX_MENTION_TOTAL_CHARS,
+  findMentions,
+  folderFiles,
+  formatMentionedFiles,
+  pickFolderFiles,
+  rankPaths,
+  resolveMention,
+  shortList,
+  withFolders,
+} from './agent/mentions';
 
 /** /init выполнен, только если NAPARNIK.md создан или изменён */
 function initDone(executed: AgentCommand[]): string | undefined {
@@ -667,43 +679,91 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Пути файлов проекта (без игнорируемых git) для @-упоминаний — с кешем, чтобы не обходить проект на каждую букву */
+  /** Пути файлов и папок проекта (без игнорируемых git) для @-упоминаний — с кешем, чтобы не обходить проект на каждую букву */
   private mentionPaths(tools: WorkspaceTools): Promise<string[]> {
     const root = tools.rootUri.toString();
     const cached = this.mentionIndex;
     if (cached && cached.root === root && Date.now() - cached.at < MENTION_INDEX_TTL_MS) return cached.paths;
-    const paths = tools.findFiles(() => true, MAX_MENTION_INDEX_FILES).catch(() => []);
+    const paths = tools
+      .findFiles(() => true, MAX_MENTION_INDEX_FILES)
+      .then(withFolders)
+      .catch(() => []);
     this.mentionIndex = { root, at: Date.now(), paths };
     return paths;
   }
 
-  /** Файлы, упомянутые в вопросе через @, — блок для модели и подпись под сообщением */
+  /** Файлы и папки, упомянутые в вопросе через @, — блок для модели и подпись под сообщением */
   private async resolveMentions(text: string): Promise<{ block: string; label: string } | undefined> {
     const tokens = findMentions(text);
     const tools = tokens.length > 0 ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm) : undefined;
     if (!tools) return undefined;
     const paths = await this.mentionPaths(tools);
     const files: { path: string; text: string }[] = [];
+    const notRead: string[] = [];
     const notes: string[] = [];
+    const fileMentions: { token: string; path: string }[] = [];
+    const folderMentions: { token: string; path: string }[] = [];
     for (const token of tokens) {
       const found = resolveMention(token, paths);
-      if (found && 'path' in found) {
-        const content = await tools.readFileText(found.path).catch(() => undefined);
-        if (content === undefined) notes.push(`\`@${token}\` — не удалось прочитать (двоичный файл?)`);
-        else files.push({ path: found.path, text: content });
-      } else if (found) {
-        notes.push(`\`@${token}\` — подходит к ${found.candidates.length} файлам, уточните путь (подсказка появляется при вводе @)`);
+      if (found && 'path' in found) (found.path.endsWith('/') ? folderMentions : fileMentions).push({ token, path: found.path });
+      else if (found) {
+        notes.push(`\`@${token}\` — подходит к ${found.candidates.length} путям, уточните путь (подсказка появляется при вводе @)`);
       } else if (/[./]/.test(token)) {
         // «@Клиент» может быть просто словом, а «@a.bsl» — явно файл
-        notes.push(`\`@${token}\` — файл не найден`);
+        notes.push(`\`@${token}\` — файл или папка не найдены`);
       }
     }
-    const { text: block, skipped } = formatMentionedFiles(files);
-    if (skipped.length) notes.push(`не приложены из-за объёма: ${skipped.map((p) => `\`${p}\``).join(', ')}`);
-    if (notes.length) this.info(`Упоминания файлов: ${notes.join('; ')}.`);
+    // Явно упомянутые файлы важнее файлов папок — они первыми, папкам остаётся остаток лимита
+    for (const { token, path } of fileMentions) {
+      if (files.some((f) => f.path === path)) continue;
+      const content = await tools.readFileText(path).catch(() => undefined);
+      if (content === undefined) notes.push(`\`@${token}\` — не удалось прочитать (двоичный файл?)`);
+      else files.push({ path, text: content });
+    }
+    const used = files.reduce((sum, f) => sum + Math.min(f.text.length, MAX_MENTION_FILE_CHARS), 0);
+    const folderContents = new Map<string, string[]>();
+    const candidates: { path: string; text: string }[] = [];
+    // Папки могут пересекаться («@src/» и «@src/cf/») — один файл берём один раз; Set — в папке бывают десятки тысяч файлов
+    const seen = new Set(files.map((f) => f.path));
+    let reads = 0;
+    for (const { token, path: folder } of folderMentions) {
+      const inside = folderFiles(folder, paths);
+      folderContents.set(folder, inside);
+      if (inside.length === 0) notes.push(`\`@${token}\` — в папке нет файлов`);
+      let binary = 0;
+      for (const path of inside) {
+        if (seen.has(path)) continue;
+        seen.add(path);
+        if (reads >= MAX_FOLDER_FILES_READ) {
+          notRead.push(path);
+          continue;
+        }
+        reads++;
+        const content = await tools.readFileText(path).catch(() => undefined);
+        if (content === undefined) binary++;
+        else candidates.push({ path, text: content });
+      }
+      if (binary) notes.push(`\`@${token}\` — пропущено двоичных файлов: ${binary}`);
+    }
+    const { picked, skipped: notFit } = pickFolderFiles(candidates, MAX_MENTION_TOTAL_CHARS - used);
+    files.push(...picked);
+    notRead.unshift(...notFit);
+    const { text: block, skipped } = formatMentionedFiles(files, notRead);
+    if (skipped.length) {
+      notes.push(`не приложены из-за объёма (${skipped.length}): ${shortList(skipped.map((p) => `\`${p}\``), 10)}`);
+    }
+    if (notes.length) this.info(`Упоминания: ${notes.join('; ')}.`);
     if (!block) return undefined;
-    const shown = files.filter((f) => !skipped.includes(f.path));
-    return { block, label: shown.map((f) => '@' + f.path.split('/').pop()).join(', ') };
+    const notAttached = new Set(skipped);
+    const shownPaths = new Set(files.map((f) => f.path).filter((p) => !notAttached.has(p)));
+    const attached = (path: string) => shownPaths.has(path);
+    const labels = [
+      ...fileMentions.filter((m) => attached(m.path)).map((m) => '@' + m.path.split('/').pop()),
+      ...folderMentions
+        .filter((m) => folderContents.get(m.path)!.some(attached))
+        .map((m) => '@' + m.path.slice(0, -1).split('/').pop() + '/'),
+    ];
+    return { block, label: [...new Set(labels)].join(', ') };
   }
 
   /** Ответ пришёл в чат, который пользователь сейчас не видит, — сообщаем */
@@ -752,7 +812,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </button>
     </div>
     <div id="slash-menu" class="slash-menu hidden" role="listbox"></div>
-    <textarea id="input" rows="3" placeholder="Задай мне вопрос… «/» — команды, «@» — файл проекта&#10;Enter — отправить, Shift+Enter — новая строка"></textarea>
+    <textarea id="input" rows="3" placeholder="Задай мне вопрос… «/» — команды, «@» — файл или папка проекта&#10;Enter — отправить, Shift+Enter — новая строка"></textarea>
     <div class="actions">
       <button type="button" id="stop" class="secondary hidden">Стоп</button>
       <button type="submit" id="send">Отправить</button>

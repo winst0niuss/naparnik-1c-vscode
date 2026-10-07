@@ -113,7 +113,7 @@
       slashMenu.classList.remove('hidden');
       return;
     }
-    // «@часть-пути» прямо перед курсором — просим у расширения подходящие файлы
+    // «@часть-пути» прямо перед курсором — просим у расширения подходящие файлы и папки
     const mention = input.value.slice(0, input.selectionStart).match(/(?:^|\s)@([^\s"]*)$/);
     if (!mention) {
       mentionQuery = null;
@@ -146,9 +146,12 @@
       const desc = document.createElement('span');
       desc.className = 'slash-desc';
       if (c.path !== undefined) {
-        const slash = c.path.lastIndexOf('/');
-        name.textContent = c.path.slice(slash + 1);
-        desc.textContent = slash > 0 ? c.path.slice(0, slash) : '';
+        // Папка — с «/» на конце: показываем «Имя/» и путь к ней
+        const isFolder = c.path.endsWith('/');
+        const bare = isFolder ? c.path.slice(0, -1) : c.path;
+        const slash = bare.lastIndexOf('/');
+        name.textContent = bare.slice(slash + 1) + (isFolder ? '/' : '');
+        desc.textContent = slash > 0 ? bare.slice(0, slash) : '';
         row.title = c.path;
       } else {
         name.textContent = '/' + c.name;
@@ -170,7 +173,7 @@
     else chooseCommand(item, run);
   }
 
-  /** Заменить «@часть» перед курсором полным путём файла; путь с пробелами — в кавычках */
+  /** Заменить «@часть» перед курсором полным путём файла или папки; путь с пробелами — в кавычках */
   function insertMention(item) {
     if (!item) return;
     hideMenu();

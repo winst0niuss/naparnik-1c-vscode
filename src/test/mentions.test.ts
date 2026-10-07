@@ -1,6 +1,16 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { MAX_MENTION_FILE_CHARS, MAX_MENTION_TOTAL_CHARS, findMentions, formatMentionedFiles, rankPaths, resolveMention } from '../agent/mentions';
+import {
+  MAX_MENTION_FILE_CHARS,
+  MAX_MENTION_TOTAL_CHARS,
+  findMentions,
+  folderFiles,
+  formatMentionedFiles,
+  pickFolderFiles,
+  rankPaths,
+  resolveMention,
+  withFolders,
+} from '../agent/mentions';
 
 const PATHS = [
   'README.md',
@@ -44,4 +54,49 @@ test('formatMentionedFiles: язык по расширению, обрезка �
   assert.ok(r.skipped.length > 0);
   assert.ok(r.text.includes('Не приложены из-за объёма'));
   assert.deepEqual(formatMentionedFiles([]), { text: '', skipped: [] });
+});
+
+test('withFolders: все папки путей с «/» на конце, без повторов', () => {
+  assert.deepEqual(withFolders(['a/b/c.bsl', 'a/d.md', 'e.txt']), ['a/b/c.bsl', 'a/d.md', 'e.txt', 'a/', 'a/b/']);
+});
+
+test('resolveMention: папка по пути, с «/» и без, по имени; «/» на конце — только папка', () => {
+  const paths = withFolders([...PATHS, 'src/cf/Catalogs/Клиенты.xml']);
+  assert.deepEqual(resolveMention('src/cf/Catalogs/Клиенты', paths), { path: 'src/cf/Catalogs/Клиенты/' });
+  assert.deepEqual(resolveMention('src/cf/Catalogs/Клиенты/', paths), { path: 'src/cf/Catalogs/Клиенты/' });
+  assert.deepEqual(resolveMention('Заявка', paths), { path: 'src/cf/Documents/Заявка/' });
+  assert.deepEqual(resolveMention('Catalogs/', paths), { path: 'src/cf/Catalogs/' });
+  assert.deepEqual(resolveMention('Ext/', paths), {
+    candidates: ['src/cf/Catalogs/Клиенты/Ext/', 'src/cf/Documents/Заявка/Ext/', 'src/cf/CommonModules/ОбщегоНазначения/Ext/'],
+  });
+  assert.deepEqual(resolveMention('README.md', paths), { path: 'README.md' });
+});
+
+test('rankPaths: папки в подсказках, точное имя папки выше', () => {
+  const paths = withFolders(PATHS);
+  assert.equal(rankPaths('заявка', paths)[0], 'src/cf/Documents/Заявка/');
+  assert.deepEqual(rankPaths('', paths, 3), ['src/', 'docs/', 'README.md']);
+});
+
+test('folderFiles: файлы папки, описания и верхние уровни первыми, без вложенных папок', () => {
+  const paths = withFolders(['p/z.bsl', 'p/sub/a.bsl', 'p/README.md', 'p/sub/notes.md', 'q/x.bsl']);
+  assert.deepEqual(folderFiles('p/', paths), ['p/README.md', 'p/sub/notes.md', 'p/z.bsl', 'p/sub/a.bsl']);
+  assert.deepEqual(folderFiles('p/sub/', paths), ['p/sub/notes.md', 'p/sub/a.bsl']);
+});
+
+test('formatMentionedFiles: непрочитанные файлы папки — в списке неприложенных, длинный список сокращается', () => {
+  const notRead = Array.from({ length: 250 }, (_, i) => `p/f${i}.bsl`);
+  const r = formatMentionedFiles([{ path: 'a.bsl', text: 'x' }], notRead);
+  assert.equal(r.skipped.length, 250);
+  assert.ok(r.text.includes('… и ещё 50'));
+});
+
+test('pickFolderFiles: только целиком и в пределах остатка лимита, большой файл не вытесняет следующие', () => {
+  const big = { path: 'f/Form.xml', text: 'x'.repeat(MAX_MENTION_FILE_CHARS + 1) };
+  const mid = { path: 'f/b.bsl', text: 'x'.repeat(80) };
+  const small = { path: 'f/c.bsl', text: 'x'.repeat(30) };
+  const r = pickFolderFiles([{ path: 'f/a.bsl', text: 'x'.repeat(50) }, big, mid, small], 100);
+  assert.deepEqual(r.picked.map((f) => f.path), ['f/a.bsl', 'f/c.bsl']);
+  assert.deepEqual(r.skipped, ['f/Form.xml', 'f/b.bsl']);
+  assert.deepEqual(pickFolderFiles([small], -5), { picked: [], skipped: ['f/c.bsl'] });
 });

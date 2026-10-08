@@ -19,7 +19,7 @@ export type AgentCommand =
 export type GitCommand =
   | { kind: 'git_status' }
   | { kind: 'git_diff'; path?: string }
-  | { kind: 'git_log'; count?: number }
+  | { kind: 'git_log'; count?: number; path?: string }
   | { kind: 'git_branch' }
   | { kind: 'git_create_branch'; name: string }
   | { kind: 'git_checkout'; branch: string }
@@ -107,7 +107,7 @@ const GIT_PROMPT = `
 Git (чтение выполняется сразу, остальное пользователь подтверждает):
 @git_status — текущая ветка, изменённые и новые файлы
 @git_diff ФАЙЛ — незакоммиченные изменения файла; без ФАЙЛА — всех файлов
-@git_log N — последние N коммитов (по умолчанию 10)
+@git_log N — последние N коммитов (по умолчанию 10); @git_log N | ФАЙЛ — коммиты, менявшие файл или папку (кто и когда менял)
 @git_branch — список веток
 @git_create_branch ИМЯ — создать ветку и перейти на неё
 @git_checkout ВЕТКА — перейти на существующую ветку
@@ -303,8 +303,13 @@ function parseGitCommand(kind: string, arg: string): GitCommand | undefined {
       return path ? { kind, path } : { kind };
     }
     case 'git_log': {
-      const count = Number(arg.match(/\d+/)?.[0]);
-      return count > 0 ? { kind, count } : { kind };
+      // «5 | src/a.bsl», «src/a.bsl», «-n 5 -- src/a.bsl», «-1 src/a.bsl»
+      const [left, right] = arg.includes('|') ? arg.split('|', 2) : [arg, ''];
+      const words = left.split(/\s+/).filter((a) => a && a !== '--');
+      const countWord = words.find((a) => /^-?\d+$/.test(a));
+      const count = Math.abs(Number(countWord));
+      const path = unquote(right || words.filter((a) => a !== countWord && !a.startsWith('-')).join(' '));
+      return { kind, ...(count > 0 ? { count } : {}), ...(path ? { path } : {}) };
     }
     case 'git_create_branch':
       return arg ? { kind, name: arg } : undefined;
@@ -454,7 +459,7 @@ export function describeCommand(cmd: AgentCommand): string {
     case 'git_diff':
       return `🔀 git diff${cmd.path ? ` ${cmd.path}` : ''}`;
     case 'git_log':
-      return `🔀 git log${cmd.count ? ` (${cmd.count})` : ''}`;
+      return `🔀 git log${cmd.path ? ` ${cmd.path}` : ''}${cmd.count ? ` (${cmd.count})` : ''}`;
     case 'git_branch':
       return '🔀 git branch';
     case 'git_create_branch':

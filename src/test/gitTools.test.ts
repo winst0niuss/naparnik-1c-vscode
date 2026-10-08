@@ -25,8 +25,8 @@ function mockRepo(overrides: Partial<GitRepository['state']> = {}) {
     diff: async (cached) => (cached ? 'diff --git a/staged.bsl' : 'diff --git a/work.bsl'),
     diffWithHEAD: async (p) => `unstaged ${p}`,
     diffIndexWithHEAD: async () => '',
-    log: async ({ maxEntries } = {}) =>
-      [{ hash: 'abc1234567', message: 'feat: первое\n\nописание', authorName: 'Автор', authorDate: new Date('2026-10-01T10:00:00Z') }].slice(0, maxEntries),
+    log: async ({ maxEntries, path: file } = {}) =>
+      (file ? [{ hash: 'def4567890', message: `fix: ${path.relative(ROOT, file)}`, authorName: 'Другой' }] : [{ hash: 'abc1234567', message: 'feat: первое\n\nописание', authorName: 'Автор', authorDate: new Date('2026-10-01T10:00:00Z') }]).slice(0, maxEntries),
     getBranches: async ({ remote }) => (remote ? [{ name: 'origin/main', remote: 'origin' }, { name: 'origin/feature', remote: 'origin' }] : [{ name: 'main' }, { name: 'dev' }]),
     createBranch: async (name, checkout) => void calls.push(`createBranch ${name} ${checkout}`),
     checkout: async (t) => void calls.push(`checkout ${t}`),
@@ -75,6 +75,12 @@ test('git diff файла вне проекта — ошибка', async () => {
 test('git log: короткий хеш, дата, автор, заголовок', async () => {
   const { git } = tools(mockRepo().repo);
   assert.equal(await git.run({ kind: 'git_log', count: 5 }), 'abc1234 2026-10-01 Автор: feat: первое');
+});
+
+test('git log файла: только его коммиты; вне проекта — ошибка', async () => {
+  const { git } = tools(mockRepo().repo);
+  assert.equal(await git.run({ kind: 'git_log', count: 1, path: 'src/a.ts' }), 'def4567 Другой: fix: src/a.ts');
+  assert.match(await git.run({ kind: 'git_log', path: '../secret' }), /вне проекта/);
 });
 
 test('коммит: ничего не подготовлено — все изменения; без postCommitCommand; отказ — ничего не делаем', async () => {

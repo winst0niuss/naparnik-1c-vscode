@@ -284,6 +284,13 @@ test('git-команды: строки с аргументами и коммит
   ]);
 });
 
+test('git_log: число и файл в разных записях', () => {
+  assert.deepEqual(parseCommands('@git_log 1 | src/fixtures/esb.fixture.ts'), [{ kind: 'git_log', count: 1, path: 'src/fixtures/esb.fixture.ts' }]);
+  assert.deepEqual(parseCommands('@git_log src/a.ts'), [{ kind: 'git_log', path: 'src/a.ts' }]);
+  assert.deepEqual(parseCommands('@git_log -n 3 -- src/a.ts'), [{ kind: 'git_log', count: 3, path: 'src/a.ts' }]);
+  assert.deepEqual(parseCommands('@git_log -1 "src/a b.ts"'), [{ kind: 'git_log', count: 1, path: 'src/a b.ts' }]);
+});
+
 test('git_commit: сообщение в той же строке; блок без @end закрывает следующая команда', () => {
   assert.deepEqual(parseCommands('@git_commit feat: новое'), [{ kind: 'git_commit', message: 'feat: новое' }]);
   assert.deepEqual(parseCommands('@git_commit\nfix: x\n@git_push'), [{ kind: 'git_commit', message: 'fix: x' }, { kind: 'git_push' }]);

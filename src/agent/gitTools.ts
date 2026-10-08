@@ -48,7 +48,7 @@ export interface GitRepository {
   diffWithHEAD(path: string): Promise<string>;
   /** `git diff --cached -- path` */
   diffIndexWithHEAD(path: string): Promise<string>;
-  log(options?: { maxEntries?: number }): Promise<{ hash: string; message: string; authorName?: string; authorDate?: Date }[]>;
+  log(options?: { maxEntries?: number; path?: string }): Promise<{ hash: string; message: string; authorName?: string; authorDate?: Date }[]>;
   getBranches(query: { remote?: boolean }): Promise<GitRef[]>;
   createBranch(name: string, checkout: boolean): Promise<void>;
   checkout(treeish: string): Promise<void>;
@@ -190,7 +190,7 @@ export class GitTools {
         case 'git_diff':
           return await this.diffText(cmd.path ? this.resolve(cmd.path) : undefined);
         case 'git_log':
-          return await this.logText(Math.min(Math.max(cmd.count ?? DEFAULT_LOG, 1), MAX_LOG));
+          return await this.logText(Math.min(Math.max(cmd.count ?? DEFAULT_LOG, 1), MAX_LOG), cmd.path ? this.resolve(cmd.path) : undefined);
         case 'git_branch':
           return await this.branchText();
         case 'git_create_branch':
@@ -260,9 +260,10 @@ export class GitTools {
       : text;
   }
 
-  async logText(count = DEFAULT_LOG): Promise<string> {
-    const commits = await this.repo.log({ maxEntries: count });
-    if (commits.length === 0) return 'Коммитов пока нет.';
+  async logText(count = DEFAULT_LOG, target?: string): Promise<string> {
+    // path — `git log -- path`: только коммиты, менявшие файл или папку
+    const commits = await this.repo.log(target ? { maxEntries: count, path: target } : { maxEntries: count });
+    if (commits.length === 0) return target ? `Коммитов, менявших ${this.relative(target)}, нет.` : 'Коммитов пока нет.';
     return commits
       .map((c) => {
         const date = c.authorDate ? c.authorDate.toISOString().slice(0, 10) + ' ' : '';

@@ -289,6 +289,8 @@ test('git_log: число и файл в разных записях', () => {
   assert.deepEqual(parseCommands('@git_log src/a.ts'), [{ kind: 'git_log', path: 'src/a.ts' }]);
   assert.deepEqual(parseCommands('@git_log -n 3 -- src/a.ts'), [{ kind: 'git_log', count: 3, path: 'src/a.ts' }]);
   assert.deepEqual(parseCommands('@git_log -1 "src/a b.ts"'), [{ kind: 'git_log', count: 1, path: 'src/a b.ts' }]);
+  assert.deepEqual(parseCommands('@git_log --oneline -n5'), [{ kind: 'git_log', count: 5 }]);
+  assert.deepEqual(parseCommands('@git_log --max-count=3'), [{ kind: 'git_log', count: 3 }]);
 });
 
 test('git_commit: сообщение в той же строке; блок без @end закрывает следующая команда', () => {

@@ -303,11 +303,11 @@ function parseGitCommand(kind: string, arg: string): GitCommand | undefined {
       return path ? { kind, path } : { kind };
     }
     case 'git_log': {
-      // «5 | src/a.bsl», «src/a.bsl», «-n 5 -- src/a.bsl», «-1 src/a.bsl»
+      // «5 | src/a.bsl», «src/a.bsl», «-n 5 -- src/a.bsl», «-1 src/a.bsl», «--max-count=5»
       const [left, right] = arg.includes('|') ? arg.split('|', 2) : [arg, ''];
       const words = left.split(/\s+/).filter((a) => a && a !== '--');
-      const countWord = words.find((a) => /^-?\d+$/.test(a));
-      const count = Math.abs(Number(countWord));
+      const countWord = words.find((a) => /^(?:-n|--max-count=|-)?\d+$/.test(a));
+      const count = Number(countWord?.match(/\d+/)?.[0]);
       const path = unquote(right || words.filter((a) => a !== countWord && !a.startsWith('-')).join(' '));
       return { kind, ...(count > 0 ? { count } : {}), ...(path ? { path } : {}) };
     }

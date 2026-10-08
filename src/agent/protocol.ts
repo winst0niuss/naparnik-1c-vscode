@@ -12,7 +12,44 @@ export type AgentCommand =
   | { kind: 'create_file'; path: string; content: string }
   | { kind: 'move_file'; from: string; to: string }
   | { kind: 'copy_file'; from: string; to: string }
-  | { kind: 'delete_file'; path: string };
+  | { kind: 'delete_file'; path: string }
+  | GitCommand;
+
+/** Команды git: каждую подтверждает пользователь, выполняет встроенное расширение Git */
+export type GitCommand =
+  | { kind: 'git_status' }
+  | { kind: 'git_diff'; path?: string }
+  | { kind: 'git_log'; count?: number }
+  | { kind: 'git_branch' }
+  | { kind: 'git_create_branch'; name: string }
+  | { kind: 'git_checkout'; branch: string }
+  | { kind: 'git_commit'; message: string }
+  // flags — то, что модель дописала по привычке CLI («--force», «--rebase»): такие варианты не выполняем
+  | { kind: 'git_pull'; flags?: string }
+  | { kind: 'git_push'; flags?: string };
+
+export function isGitCommand(cmd: AgentCommand): cmd is GitCommand {
+  return cmd.kind.startsWith('git_');
+}
+
+/** Git-действие пришло в одном ответе с чтением git, результатов которого модель ещё не видела, — не выполнено */
+export const GIT_DEFERRED_HINT =
+  'Не выполнено: команда пришла в одном ответе с @git_status/@git_diff/@git_log/@git_branch, их результатов ты ещё не видел. ' +
+  'Посмотри результаты выше; если действие всё ещё нужно и о нём просили — пришли его отдельным ответом (сообщение коммита — по diff).';
+
+/** Модель написала git-команду, которой нет (reset, rebase, stash…) */
+export const GIT_UNSUPPORTED_HINT =
+  'Такой git-команды нет: доступны только @git_status, @git_diff, @git_log, @git_branch, @git_create_branch, @git_checkout, @git_commit, @git_pull, @git_push. ' +
+  'Не пиши её снова — ответь текстом: это нужно сделать вручную, и как именно.';
+
+/** Модель настаивает на несуществующей git-команде — пользователю вместо сырой строки */
+export function gitUnsupportedAnswer(text: string): string {
+  const command = text.trim().split('\n')[0].replace(/^@git[ _]?/i, 'git ');
+  return `Эту операцию git Напарник не выполняет. Если она нужна, выполните её вручную в терминале:\n\n\`\`\`\n${command}\n\`\`\``;
+}
+
+/** Команды git, которые только читают — их результат нужен модели, состояние репозитория не меняется */
+export const GIT_READ_COMMANDS = new Set<AgentCommand['kind']>(['git_status', 'git_diff', 'git_log', 'git_branch']);
 
 export interface SearchReplace {
   search: string;
@@ -65,11 +102,40 @@ export const AGENT_CONTINUE_HINT =
   'Не вызывай больше инструменты: план (TodoWrite) не нужен, субагентов (Task) и инструментов 1С:EDT здесь нет. ' +
   'Продолжи задачу сам командами @list_dir, @read_file, @search, @edit_file, @create_file — несколько в одном ответе — или дай итоговый ответ текстом.';
 
+/** Команды git в первом сообщении — только если проект в репозитории */
+const GIT_PROMPT = `
+Git (чтение выполняется сразу, остальное пользователь подтверждает):
+@git_status — текущая ветка, изменённые и новые файлы
+@git_diff ФАЙЛ — незакоммиченные изменения файла; без ФАЙЛА — всех файлов
+@git_log N — последние N коммитов (по умолчанию 10)
+@git_branch — список веток
+@git_create_branch ИМЯ — создать ветку и перейти на неё
+@git_checkout ВЕТКА — перейти на существующую ветку
+@git_commit
+СООБЩЕНИЕ
+@end
+— коммит; СООБЩЕНИЕ — сам текст коммита без подписей («сообщение:») и кавычек: первая строка — заголовок, описание — после пустой строки
+@git_pull — подтянуть изменения текущей ветки
+@git_push — отправить текущую ветку
+Git-команды — только когда пользователь спрашивает о git или просит; коммит, смену ветки, pull и push — только по его прямой просьбе.
+Коммит: сначала одним ответом @git_status, @git_diff и @git_log 5, а @git_commit — следующим ответом, по их результатам: сообщение по diff, в стиле последних коммитов и правил проекта. В коммит войдут подготовленные (staged) файлы, а если их нет — все изменения; @git add не нужен.
+Делай только то git-действие, о котором прямо просили. Не просьба о другом действии:
+- «запушь» — не просьба закоммитить: незакоммиченное не коммить и pull не делай, а скажи, что мешает;
+- «перейди на ветку X», а её нет — не просьба создать X;
+- «push --force», «удали ветку», «reset» — не просьба о похожей доступной команде: их нет, объясни, как сделать вручную, и ничего не выполняй;
+- после pull не меняй файлы.
+Пользователь отклонил git-действие или git вернул ошибку — не повторяй и не обходи другими командами, сообщи пользователю.
+Ревью изменений — по @git_diff: реальные проблемы с файлом и причиной, без мелочей оформления; сам ничего не правь, пока не попросят.
+Других операций git (reset, rebase, merge, stash, удаление веток, push --force) нет.
+`;
+
 /** Инструкция для модели. Отправляется первым сообщением чата с включённым доступом к проекту */
 export function buildAgentPrompt(
   projectTree: { text: string; complete: boolean },
   question: string,
   context: ProjectContext = EMPTY_CONTEXT,
+  /** Проект в репозитории git — описать команды git */
+  git = false,
 ): string {
   const treeTitle = projectTree.complete
     ? 'Структура проекта (полная — все папки и файлы уже перечислены, @list_dir для них не нужен):'
@@ -100,7 +166,7 @@ export function buildAgentPrompt(
 @copy_file ОТКУДА | КУДА — копия, исходный файл остаётся
 @delete_file ПУТЬ — удалить файл или папку (в корзину)
 КУДА — новый путь или существующая папка, в которую переносится.
-
+${git ? GIT_PROMPT : ''}
 Экономь шаги — их число ограничено:
 - В одном ответе отправляй сразу все нужные команды: например, 5–10 @read_file подряд, а не по одному файлу за ответ.
 - Структура проекта ниже уже показана — не смотри повторно то, что в ней видно. Чтобы увидеть глубже, используй @list_dir ПАПКА | 3.
@@ -124,7 +190,14 @@ ${projectTree.text}
 ${renderContext(context)}Вопрос пользователя: ${question}`;
 }
 
-const LINE_COMMAND = /^\s*@(list_dir|read_file|search|edit_file|create_file|move_file|copy_file|delete_file)\b[ \t]*(.*)$/;
+const GIT_KINDS = 'git_status|git_diff|git_log|git_branch|git_create_branch|git_checkout|git_commit|git_pull|git_push';
+// «@git push», «@git commit» — модель иногда пишет как в CLI, через пробел
+const GIT_SPACED = /^(\s*)@git[ \t]+(status|diff|log|branch|checkout|commit|pull|push)\b/;
+const LINE_COMMAND = new RegExp(
+  `^\\s*@(list_dir|read_file|search|edit_file|create_file|move_file|copy_file|delete_file|${GIT_KINDS})\\b[ \\t]*(.*)$`,
+);
+/** Начало блока до @end: правка, новый файл, коммит с сообщением на следующих строках */
+const BLOCK_START = /^\s*@(edit_file|create_file|git_commit)\b/;
 
 /** Найти команды в ответе модели. Пустой массив — это обычный ответ */
 export function parseCommands(text: string): AgentCommand[] {
@@ -136,7 +209,7 @@ export function parseCommands(text: string): AgentCommand[] {
 /** Основной синтаксис: строки «@команда аргументы», блоки правок до «@end» */
 function parseLineCommands(text: string): AgentCommand[] {
   const commands: AgentCommand[] = [];
-  const lines = text.split(/\r?\n/);
+  const lines = text.split(/\r?\n/).map((l) => l.replace(GIT_SPACED, '$1@git_$2'));
 
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(LINE_COMMAND);
@@ -161,6 +234,13 @@ function parseLineCommands(text: string): AgentCommand[] {
     } else if (kind === 'move_file' || kind === 'copy_file') {
       const pair = splitPathPair(rawArg);
       if (pair) commands.push({ kind, from: pair[0], to: pair[1] });
+    } else if (kind === 'git_commit' && arg) {
+      // «@git_commit fix: сообщение» — однострочное сообщение без блока; «-m "…"» — привычка CLI
+      const message = unquote(arg.replace(/^(-a\s+)?-a?m\s+/, ''));
+      if (message) commands.push({ kind, message });
+    } else if (kind.startsWith('git_') && kind !== 'git_commit') {
+      const git = parseGitCommand(kind, arg);
+      if (git) commands.push(git);
     } else {
       // Тело блока — до @end. Модель иногда забывает @end: тогда блок закрывает следующая @-команда или конец ответа
       const body: string[] = [];
@@ -170,6 +250,11 @@ function parseLineCommands(text: string): AgentCommand[] {
           break;
         }
         body.push(lines[i]);
+      }
+      if (kind === 'git_commit') {
+        const message = stripFence(body.join('\n')).trim();
+        if (message) commands.push({ kind, message });
+        continue;
       }
       if (!arg) continue;
       if (kind === 'edit_file') {
@@ -192,12 +277,45 @@ function parseLineCommands(text: string): AgentCommand[] {
 function startsNextCommand(lines: string[], i: number): boolean {
   const m = lines[i].match(LINE_COMMAND);
   if (!m) return false;
-  if (m[1] === 'edit_file' || m[1] === 'create_file') return true;
+  if (BLOCK_START.test(lines[i])) return true;
   for (let j = i + 1; j < lines.length; j++) {
     if (/^\s*@end\s*$/.test(lines[j])) return false;
-    if (/^\s*@(edit_file|create_file)\b/.test(lines[j])) return true;
+    if (BLOCK_START.test(lines[j])) return true;
   }
   return true;
+}
+
+/** Аргументы git-команды из строки: «@git_log 5», «@git_diff src/a.bsl», «@git_checkout develop» */
+function parseGitCommand(kind: string, arg: string): GitCommand | undefined {
+  switch (kind) {
+    case 'git_status':
+    case 'git_branch':
+      return { kind };
+    case 'git_pull':
+    case 'git_push': {
+      // «origin main» не мешает — всегда текущая ветка; флаги («--force», «--rebase») — отдельная операция
+      const flags = arg.split(/\s+/).filter((a) => a.startsWith('-')).join(' ');
+      return flags ? { kind, flags } : { kind };
+    }
+    case 'git_diff': {
+      // «--staged», «--cached» и т. п. не нужны: diff и так показывает подготовленное отдельно
+      const path = unquote(arg.split(/\s+/).filter((a) => a && !a.startsWith('-')).join(' '));
+      return path ? { kind, path } : { kind };
+    }
+    case 'git_log': {
+      const count = Number(arg.match(/\d+/)?.[0]);
+      return count > 0 ? { kind, count } : { kind };
+    }
+    case 'git_create_branch':
+      return arg ? { kind, name: arg } : undefined;
+    case 'git_checkout': {
+      // «@git_checkout -b имя» — создание ветки, как в CLI
+      const create = arg.match(/^-b\s+(\S+)$/);
+      if (create) return { kind: 'git_create_branch', name: unquote(create[1]) };
+      return arg ? { kind, branch: arg } : undefined;
+    }
+  }
+  return undefined;
 }
 
 /** Запасной синтаксис: <read_file path="a"/> или <read_file><path>a</path></read_file> */
@@ -255,15 +373,16 @@ export function parseSearchReplace(body: string): SearchReplace[] {
 export function stripCommandsForDisplay(text: string): string {
   return text
     // Блоки правок — до @end или до конца (ещё печатается)
-    .replace(/^[ \t]*@(edit_file|create_file)\b[\s\S]*?(^[ \t]*@end[ \t]*$|(?![\s\S]))/gm, '')
-    .replace(/^[ \t]*@(list_dir|read_file|search|move_file|copy_file|delete_file)\b.*$/gm, '')
+    .replace(/^[ \t]*@(edit_file|create_file|git_commit[ \t]*$)[\s\S]*?(^[ \t]*@end[ \t]*$|(?![\s\S]))/gm, '')
+    .replace(/^[ \t]*@(list_dir|read_file|search|move_file|copy_file|delete_file|git_\w+)\b.*$/gm, '')
     // Недописанная команда в конце стрима: «@rea»
     .replace(/(^|\n)[ \t]*@\w*$/, '')
     // XML-вариант
     .replace(/<edit_file[\s\S]*?(<\/edit_file>|$)/g, '')
     .replace(/<create_file[\s\S]*?(<\/create_file>|$)/g, '')
     .replace(/<(list_dir|read_file|search)\b[\s\S]*?(\/>|<\/\1>|$)/g, '')
-    .replace(/<[a-z_]*(\s[^>]*)?$/, '')
+    // Недописанный тег в конце стрима: «<read_fi», «<edit_file path="a». Не «Если А < Б» в коде — там после «<» не буква
+    .replace(/<[a-z_]+(\s[^>\n]*)?$/, '')
     // Пустые ``` после вырезания команд
     .replace(/```\w*\s*```/g, '')
     .replace(/```\w*\s*$/, '')
@@ -330,6 +449,24 @@ export function describeCommand(cmd: AgentCommand): string {
       return `📑 Предлагаю скопировать ${cmd.from} → ${cmd.to}`;
     case 'delete_file':
       return `🗑️ Предлагаю удалить ${cmd.path}`;
+    case 'git_status':
+      return '🔀 git status';
+    case 'git_diff':
+      return `🔀 git diff${cmd.path ? ` ${cmd.path}` : ''}`;
+    case 'git_log':
+      return `🔀 git log${cmd.count ? ` (${cmd.count})` : ''}`;
+    case 'git_branch':
+      return '🔀 git branch';
+    case 'git_create_branch':
+      return `🔀 Предлагаю создать ветку ${cmd.name}`;
+    case 'git_checkout':
+      return `🔀 Предлагаю перейти на ветку ${cmd.branch}`;
+    case 'git_commit':
+      return `🔀 Предлагаю коммит «${cmd.message.split('\n')[0]}»`;
+    case 'git_pull':
+      return `🔀 Предлагаю git pull${cmd.flags ? ` ${cmd.flags}` : ''}`;
+    case 'git_push':
+      return `🔀 Предлагаю git push${cmd.flags ? ` ${cmd.flags}` : ''}`;
   }
 }
 
@@ -486,7 +623,7 @@ export function looksLikeTextToolCall(text: string): boolean {
 }
 
 export const TEXT_TOOL_CALL_HINT =
-  'Вызов инструмента не выполнен: ты написал его текстом. Инструменты (mcp__syntax-checker__validate, поиск по ИТС) вызывай как инструменты, а не текстом в ответе; @-команды — только @list_dir, @read_file, @search, @edit_file, @create_file, @move_file, @copy_file, @delete_file.';
+  'Вызов инструмента не выполнен: ты написал его текстом. Инструменты (mcp__syntax-checker__validate, поиск по ИТС) вызывай как инструменты, а не текстом в ответе; @-команды — только @list_dir, @read_file, @search, @edit_file, @create_file, @move_file, @copy_file, @delete_file и @git_… из списка команд git.';
 
 export const MALFORMED_EDIT_HINT =
   'Правка не выполнена: блоки SEARCH/REPLACE должны быть внутри команды — строка «@edit_file путь», затем блоки, затем «@end». Повтори правку в этом формате.';

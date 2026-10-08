@@ -7,12 +7,17 @@ import {
   AGENT_CONTINUE_HINT,
   AGENT_UNAVAILABLE_TOOL_HINT,
   AgentCommand,
+  GIT_DEFERRED_HINT,
+  GIT_READ_COMMANDS,
+  GIT_UNSUPPORTED_HINT,
+  gitUnsupportedAnswer,
   MALFORMED_EDIT_HINT,
   TEXT_TOOL_CALL_HINT,
   changedCode,
   describeCommand,
   emulatedCommand,
   isBslPath,
+  isGitCommand,
   looksLikeMalformedEdit,
   looksLikeTextToolCall,
   parseCommands,
@@ -81,6 +86,10 @@ const READ_COMMANDS = new Set<AgentCommand['kind']>(['list_dir', 'read_file', 's
 export function looksLikeUnfinishedIntent(text: string): boolean {
   const t = text.trim();
   if (t.length > 500) return false;
+  // Модель спрашивает пользователя («Хотите, чтобы я закоммитил?») или предлагает («если нужно — сделаю git diff») —
+  // ждём его ответа, а не подталкиваем: напоминание продолжить заставляло её делать предложенное
+  // (коммит, push; после pull — заново применить diff к файлам)
+  if (t.endsWith('?') || /если (нужно|надо|хотите|потребуется)|дайте знать|могу /i.test(t)) return false;
   // «Использую @-команды:» — короткий ответ, оборванный на двоеточии, явно не итог (наблюдалось на живом API)
   if (t.length < 200 && t.endsWith(':')) return true;
   // Глагол действия «сейчас/дальше» — признак намерения; «создан», «готово» — признак выполненной задачи.
@@ -156,10 +165,18 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       if (tools?.readOnly && EDIT_COMMAND_LINE.test(answer.text)) {
         return { ...answer, text: READ_ONLY_ANSWER, steps: step, finishedByLimit: finishing };
       }
+      // Несуществующая git-команда («@git reset --hard»): своя подсказка, общая перечисляла команды, и модель повторяла её
+      const unsupportedGit = /^\s*@git[ _]?[a-z]/i.test(answer.text);
+      if (tools && unsupportedGit && (nudges >= 2 || finishing || step >= maxSteps)) {
+        // Модель настаивает — вместо сырой команды пользователь видит, что сделать вручную (живой API: 1 из 6)
+        return { ...answer, text: gitUnsupportedAnswer(answer.text), steps: step, finishedByLimit: finishing };
+      }
       // Ответ без команд, но задача явно не доделана — до двух напоминаний, если шаги ещё есть
       const notDone = !tools
         ? undefined
-        : looksLikeTextToolCall(answer.text)
+        : unsupportedGit && !tools.readOnly
+          ? GIT_UNSUPPORTED_HINT
+          : looksLikeTextToolCall(answer.text)
           ? tools.readOnly
             ? READ_ONLY_TEXT_TOOL_HINT
             : TEXT_TOOL_CALL_HINT + (syntaxRequest ? `\n\n${syntaxRequest}` : '')
@@ -177,7 +194,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     // После FINISH_HINT выполняем только правки; если модель всё равно просит читать — сдаёмся.
     // Больше двух ответов сверх лимита не ждём, чтобы не зациклиться на правках
     if (finishing) {
-      commands = commands.filter((c) => !READ_COMMANDS.has(c.kind));
+      commands = commands.filter((c) => !READ_COMMANDS.has(c.kind) && !GIT_READ_COMMANDS.has(c.kind));
       if (commands.length === 0 || step > maxSteps + 1) {
         throw new Error(`Напарник не уложился в ${maxSteps} шагов. Попробуйте сузить вопрос.`);
       }
@@ -185,7 +202,22 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
 
     const results: string[] = [];
     const checks = new Map<string, string[]>(); // изменённые модули BSL → фрагменты правок
+    // Git-действие в одном ответе с чтением git, результатов которого модель ещё не видела, — решено вслепую.
+    // Живой API: коммит с сообщением «initial commit» до diff; на «запушь» — pull «на всякий случай» до статуса.
+    // Его и следующие git-действия откладываем: модель увидит состояние и пришлёт их отдельным ответом
+    const seen = new Set(executed.map((c) => c.kind));
+    const sawGitRead = [...GIT_READ_COMMANDS].some((k) => seen.has(k));
+    let gitRead = false;
+    let deferGit = false;
     for (const cmd of commands) {
+      const gitWrite = isGitCommand(cmd) && !GIT_READ_COMMANDS.has(cmd.kind);
+      if (GIT_READ_COMMANDS.has(cmd.kind)) gitRead = true;
+      // Коммиту нужен уже увиденный diff, остальным — любое увиденное чтение git
+      if (gitWrite && gitRead && !(cmd.kind === 'git_commit' ? seen.has('git_diff') : sawGitRead)) deferGit = true;
+      if (deferGit && gitWrite) {
+        results.push(`### ${describeCommand(cmd)}\n${GIT_DEFERRED_HINT}`);
+        continue;
+      }
       const description =
         tools?.readOnly && !READ_COMMANDS.has(cmd.kind) ? `⛔ Недоступно без доступа к проекту: ${describeCommand(cmd)}` : describeCommand(cmd);
       opts.onStep?.(description);

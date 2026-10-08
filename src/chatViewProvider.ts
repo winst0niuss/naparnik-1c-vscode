@@ -747,7 +747,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const client = new NaparnikClient({ token, ...readSettings() });
       chat.conversationId ??= await client.createConversation(run.abort.signal);
 
-      const tools = this.projectAccess ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm, run.abort.signal, chat.id, this.preview.confirmOperation)
+      // О каких git-действиях просили: вопрос пользователя и предыдущий ответ Напарника («закоммитить?» → «да»)
+      const previousAnswer = chat.entries.slice(0, -1).reverse().find((e) => e.role === 'assistant')?.text ?? '';
+      const tools = this.projectAccess
+        ? WorkspaceTools.forCurrentWorkspace(
+            this.preview.confirm,
+            run.abort.signal,
+            chat.id,
+            this.preview.confirmOperation,
+            this.preview.confirmGit,
+            `${text}\n${previousAnswer}`,
+          )
         : undefined;
       // Контекст редактора — перед вопросом: модель сразу видит, о каком файле и фрагменте речь.
       // Тот же неизменённый файл повторно не шлём — модель уже видела его в этом чате
@@ -777,7 +787,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       let message = question;
       if (tools && !chat.agentPrimed) {
         // Первое сообщение с доступом к проекту: инструкция по командам, дерево, документация и правила
-        message = buildAgentPrompt(await tools.tree(), question, await tools.projectContext());
+        message = buildAgentPrompt(await tools.tree(), question, await tools.projectContext(), Boolean(await tools.git()));
         chat.agentPrimed = true;
       } else if (tools && chat.agentPaused) {
         message = `(Доступ к проекту снова включён — можно использовать @-команды.)\n\n${question}`;

@@ -390,8 +390,18 @@
         const buttons = document.createElement('div');
         buttons.className = 'edit-buttons';
         const op = msg.operation;
-        card.dataset.operation = op ? '1' : '';
-        if (op) {
+        const git = msg.git;
+        card.dataset.operation = op || git ? '1' : '';
+        if (git) {
+          // Команда git, меняющая репозиторий: что будет сделано — в карточке, как у операций с файлами
+          title.textContent = '🔀 ' + git.title;
+          hint.textContent = 'Enter — выполнить, Esc — отклонить.';
+          const details = document.createElement('div');
+          details.className = 'edit-files';
+          details.textContent = git.details.join('\n\n');
+          card.append(details);
+          buttons.innerHTML = '<button data-accept="1">Выполнить</button><button class="secondary" data-accept="0">Отклонить</button>';
+        } else if (op) {
           // Перенос, копирование, удаление: diff нет — всё видно в карточке
           const what = op.isDir ? 'папку ' : '';
           title.textContent =
@@ -431,7 +441,7 @@
         else messagesEl.appendChild(card);
         // Фокус на «Применить» — Enter сразу применяет. Если пользователь что-то печатает, не мешаем
         if (!input.value.trim()) buttons.querySelector('button').focus();
-        if (currentStatus) setStatus(op ? 'Жду вашего решения' : 'Жду вашего решения по правке', WAIT_FRAMES);
+        if (currentStatus) setStatus(op || git ? 'Жду вашего решения' : 'Жду вашего решения по правке', WAIT_FRAMES);
         scrollToBottom();
         break;
       }

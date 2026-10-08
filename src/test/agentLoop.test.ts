@@ -106,7 +106,8 @@ test('looksLikeUnfinishedIntent: намерения ловим, завершён
   const { looksLikeUnfinishedIntent } = await import('../agent/agentLoop');
   for (const t of ['Хорошо, теперь читаю package.json и tsconfig.json.', 'Сейчас посмотрю структуру tests.', 'Далее изучу фикстуры:', 'Понял. Проверю конфигурацию сборки.'])
     assert.ok(looksLikeUnfinishedIntent(t), t);
-  for (const t of ['Отлично, файл NAPARNIK.md создан.', 'Хорошо, правка применена.', 'Итак, модуль проводит документ по регистру ТоварыНаСкладах.', 'Готово: добавлена проверка количества.', 'Модуль выводит сообщение пользователю.'])
+  for (const t of ['Отлично, файл NAPARNIK.md создан.', 'Хорошо, правка применена.', 'Итак, модуль проводит документ по регистру ТоварыНаСкладах.', 'Готово: добавлена проверка количества.', 'Модуль выводит сообщение пользователю.',
+    'Есть незакоммиченные изменения — нужно сначала создать коммит. Хотите, чтобы я его выполнил?'])
     assert.ok(!looksLikeUnfinishedIntent(t), t);
 });
 
@@ -203,4 +204,34 @@ test('только чтение: ответ-команда изменения п
   const invented = scriptedClient(['@write_file a.bsl\n// проверено']);
   const r2 = await runAgentLoop({ ...base, client: invented.client, tools: { ...t.tools, readOnly: true }, maxSteps: 12 });
   assert.ok(r2.text.includes('Включите «Доступ к проекту»'));
+});
+
+test('git-действие в одном ответе с непросмотренным чтением git откладывается, следующим ответом — выполняется', async () => {
+  const { client, sent } = scriptedClient([
+    '@git_status\n@git_diff\n@git_commit\nfix: x\n@end\n@git_push',
+    '@git_commit\nfix: по diff\n@end\n@git_push',
+    'Готово',
+  ]);
+  const t = tools();
+  await runAgentLoop({ ...base, client, tools: t.tools, maxSteps: 12 });
+  assert.deepEqual(
+    t.ran.map((c) => c.kind),
+    ['git_status', 'git_diff', 'git_commit', 'git_push'],
+  );
+  assert.equal((t.ran[2] as { message: string }).message, 'fix: по diff');
+  assert.match(sent[1], /Не выполнено: команда пришла в одном ответе с @git_status/);
+});
+
+test('git-действие без чтения в том же ответе или после увиденного статуса — сразу', async () => {
+  const { client } = scriptedClient(['@git_push', '@git_status', '@git_status\n@git_pull', 'Готово']);
+  const t = tools();
+  await runAgentLoop({ ...base, client, tools: t.tools, maxSteps: 12 });
+  assert.deepEqual(t.ran.map((c) => c.kind), ['git_push', 'git_status', 'git_status', 'git_pull']);
+});
+
+test('несуществующая git-команда: своя подсказка, а если модель настаивает — понятный текст вместо сырой команды', async () => {
+  const { client, sent } = scriptedClient(['@git reset --hard HEAD']);
+  const r = await runAgentLoop({ ...base, client, tools: tools().tools, maxSteps: 12 });
+  assert.match(sent[1], /Такой git-команды нет/);
+  assert.match(r.text, /^Эту операцию git Напарник не выполняет[\s\S]*```\ngit reset --hard HEAD\n```$/);
 });

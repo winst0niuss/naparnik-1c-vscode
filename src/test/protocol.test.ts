@@ -265,3 +265,62 @@ test('ReadSystemFile и WriteSystemFile выполняются как @-кома
   assert.equal(emulatedCommand(call('WriteSystemFile', { path: 'a.md' })), undefined);
   assert.equal(emulatedCommand(call('Task', { prompt: 'изучи проект' })), undefined);
 });
+
+test('git-команды: строки с аргументами и коммит блоком до @end', () => {
+  const cmds = parseCommands(
+    ['@git_status', '@git_diff src/Модуль.bsl', '@git_log 5', '@git_branch', '@git_create_branch feature/x', '@git_checkout dev',
+      '@git_commit', 'fix: исправлена проводка', '', '- подробности', '@end', '@git_pull', '@git_push'].join('\n'),
+  );
+  assert.deepEqual(cmds, [
+    { kind: 'git_status' },
+    { kind: 'git_diff', path: 'src/Модуль.bsl' },
+    { kind: 'git_log', count: 5 },
+    { kind: 'git_branch' },
+    { kind: 'git_create_branch', name: 'feature/x' },
+    { kind: 'git_checkout', branch: 'dev' },
+    { kind: 'git_commit', message: 'fix: исправлена проводка\n\n- подробности' },
+    { kind: 'git_pull' },
+    { kind: 'git_push' },
+  ]);
+});
+
+test('git_commit: сообщение в той же строке; блок без @end закрывает следующая команда', () => {
+  assert.deepEqual(parseCommands('@git_commit feat: новое'), [{ kind: 'git_commit', message: 'feat: новое' }]);
+  assert.deepEqual(parseCommands('@git_commit\nfix: x\n@git_push'), [{ kind: 'git_commit', message: 'fix: x' }, { kind: 'git_push' }]);
+  // Без аргумента команды, которым он нужен, не выполняются; неизвестные git-команды — не наши
+  assert.deepEqual(parseCommands('@git_checkout\n@git_reset --hard'), []);
+});
+
+test('git-команды скрываются из текста ответа', () => {
+  assert.equal(stripCommandsForDisplay('Смотрю изменения.\n@git_status\n@git_diff\n@git_commit\nfix: x\n@end'), 'Смотрю изменения.');
+  assert.equal(stripCommandsForDisplay('Готово.\n@git_commit feat: y'), 'Готово.');
+});
+
+test('команды git в промпте — только для проекта в репозитории', () => {
+  const tree = { text: 'a.bsl', complete: true };
+  assert.ok(!buildAgentPrompt(tree, 'вопрос').includes('@git_status'));
+  assert.ok(buildAgentPrompt(tree, 'вопрос', undefined, true).includes('@git_status'));
+});
+
+test('описание git-шагов', () => {
+  assert.equal(describeCommand({ kind: 'git_commit', message: 'fix: x\n\nописание' }), '🔀 Предлагаю коммит «fix: x»');
+  assert.equal(describeCommand({ kind: 'git_diff', path: 'a.bsl' }), '🔀 git diff a.bsl');
+});
+
+test('git-команды в стиле CLI: -m у коммита, -b у checkout, флаги diff, push/pull с флагами', () => {
+  assert.deepEqual(parseCommands('@git_commit -m "fix: x"'), [{ kind: 'git_commit', message: 'fix: x' }]);
+  assert.deepEqual(parseCommands("@git_commit -am 'feat: y'"), [{ kind: 'git_commit', message: 'feat: y' }]);
+  assert.deepEqual(parseCommands('@git_checkout -b feature/x'), [{ kind: 'git_create_branch', name: 'feature/x' }]);
+  assert.deepEqual(parseCommands('@git_diff --staged\n@git_diff --cached a.bsl'), [{ kind: 'git_diff' }, { kind: 'git_diff', path: 'a.bsl' }]);
+  assert.deepEqual(parseCommands('@git_push origin main\n@git_push --force\n@git_pull --rebase'), [
+    { kind: 'git_push' },
+    { kind: 'git_push', flags: '--force' },
+    { kind: 'git_pull', flags: '--rebase' },
+  ]);
+});
+
+test('сравнение «<» в коде ответа не обрезает текст', () => {
+  const text = 'Проблема:\n```bsl\nЕсли Остаток < Количество Тогда\n\tОтказ = Истина;\n```\nДобавьте Прервать.';
+  assert.equal(stripCommandsForDisplay(text), text);
+  assert.equal(stripCommandsForDisplay('Смотрю.\n<read_fi'), 'Смотрю.');
+});

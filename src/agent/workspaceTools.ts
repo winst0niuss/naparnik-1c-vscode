@@ -1,10 +1,11 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { realpath } from 'node:fs/promises';
-import { AgentCommand, ProjectContext, applySearchReplace } from './protocol';
+import { AgentCommand, ProjectContext, applySearchReplace, isGitCommand } from './protocol';
 import { PROJECT_DOC_DIRS, PROJECT_DOC_FILES, RULES_DIR } from '../slashCommands';
 import { globToRegExp, parseGitignore } from './gitignore';
 import type { FileOperation } from './editPreview';
+import { ConfirmGit, GitRepository, GitTools } from './gitTools';
 
 const MAX_FILE_CHARS = 60_000;
 // Документация прикладывается к первому сообщению, только если она короткая
@@ -50,6 +51,9 @@ export class WorkspaceTools {
     // id чата — к нему привязываются карточки правок
     private readonly owner?: string,
     private readonly confirmOperation?: ConfirmOperation,
+    private readonly confirmGit?: ConfirmGit,
+    // Просьба пользователя (и предыдущий ответ Напарника): git-действия, о которых не просили, не выполняются
+    private readonly gitRequest?: string,
   ) {}
 
   static forCurrentWorkspace(
@@ -57,14 +61,30 @@ export class WorkspaceTools {
     signal?: AbortSignal,
     owner?: string,
     confirmOperation?: ConfirmOperation,
+    confirmGit?: ConfirmGit,
+    gitRequest?: string,
   ): WorkspaceTools | undefined {
     const folder = vscode.workspace.workspaceFolders?.[0];
-    return folder ? new WorkspaceTools(folder.uri, confirmEdit, signal, owner, confirmOperation) : undefined;
+    return folder ? new WorkspaceTools(folder.uri, confirmEdit, signal, owner, confirmOperation, confirmGit, gitRequest) : undefined;
+  }
+
+  private gitTools?: Promise<GitTools | undefined>;
+
+  /** Команды git для репозитория проекта; undefined — проект не в git или расширение Git выключено */
+  git(): Promise<GitTools | undefined> {
+    this.gitTools ??= findGitRepository(this.root).then((repo) =>
+      repo && this.confirmGit ? new GitTools(repo, this.root.fsPath, this.confirmGit, this.signal, this.owner, this.gitRequest) : undefined,
+    );
+    return this.gitTools;
   }
 
   /** Выполнить команду и вернуть текст результата для модели (ошибки — тоже текстом) */
   async run(cmd: AgentCommand): Promise<string> {
     try {
+      if (isGitCommand(cmd)) {
+        const git = await this.git();
+        return git ? await git.run(cmd) : 'Ошибка: git недоступен — проект не в репозитории git, папка открыта в ограниченном режиме (без доверия) или встроенное расширение Git выключено.';
+      }
       switch (cmd.kind) {
         case 'list_dir':
           return await this.listDir(cmd.path, cmd.depth);
@@ -574,5 +594,48 @@ async function realpathOfExisting(target: string): Promise<string> {
       rest.unshift(path.basename(current));
       current = parent;
     }
+  }
+}
+
+/** Подмножество API расширения vscode.git, нужное для поиска репозитория */
+interface GitApi {
+  readonly state: 'uninitialized' | 'initialized';
+  readonly onDidChangeState: vscode.Event<'uninitialized' | 'initialized'>;
+  readonly repositories: (GitRepository & { readonly rootUri: vscode.Uri })[];
+  getRepository(uri: vscode.Uri): (GitRepository & { readonly rootUri: vscode.Uri }) | null;
+  openRepository(root: vscode.Uri): Promise<(GitRepository & { readonly rootUri: vscode.Uri }) | null>;
+}
+
+/**
+ * Репозиторий проекта через встроенное расширение Git: тот, в котором лежит корень,
+ * или единственный внутри корня. Несколько репозиториев внутри — неясно, какой нужен, git не используем
+ */
+async function findGitRepository(root: vscode.Uri): Promise<GitRepository | undefined> {
+  try {
+    const ext = vscode.extensions.getExtension<{ enabled: boolean; getAPI(version: 1): GitApi }>('vscode.git');
+    if (!ext) return undefined;
+    const exports = ext.isActive ? ext.exports : await ext.activate();
+    if (!exports.enabled) return undefined;
+    const api = exports.getAPI(1);
+    // Сразу после запуска VS Code репозитории ещё открываются
+    if (api.state !== 'initialized') {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(done, 5_000);
+        const sub = api.onDidChangeState((state) => state === 'initialized' && done());
+        function done() {
+          clearTimeout(timer);
+          sub.dispose();
+          resolve();
+        }
+      });
+    }
+    const own = api.getRepository(root);
+    if (own) return own;
+    const inside = api.repositories.filter((r) => isInside(root.fsPath, r.rootUri.fsPath));
+    if (inside.length === 1) return inside[0];
+    // Поиск репозиториев в большой папке может ещё идти — корень открываем явно
+    return inside.length === 0 ? ((await api.openRepository(root)) ?? undefined) : undefined;
+  } catch {
+    return undefined;
   }
 }

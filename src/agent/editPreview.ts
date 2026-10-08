@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
+import type { GitOperation } from './gitTools';
 
 export const PROPOSED_SCHEME = 'naparnik-proposed';
 
@@ -24,6 +25,8 @@ export interface PendingEdit {
   owner?: string;
   /** Не правка текста, а операция с файлом */
   operation?: FileOperation;
+  /** Команда git, меняющая репозиторий (коммит, ветка, pull, push) */
+  git?: GitOperation;
 }
 
 /**
@@ -67,14 +70,25 @@ export class EditPreview implements vscode.TextDocumentContentProvider {
   }
 
   /** Подтверждение переноса, копирования или удаления — только карточкой в чате */
-  confirmOperation = async (operation: FileOperation, signal?: AbortSignal, owner?: string): Promise<boolean> => {
+  confirmOperation = (operation: FileOperation, signal?: AbortSignal, owner?: string): Promise<boolean> =>
+    this.confirmInChat({ label: operation.from, operation }, signal, owner);
+
+  /** Подтверждение команды git, меняющей репозиторий, — той же карточкой */
+  confirmGit = (git: GitOperation, signal?: AbortSignal, owner?: string): Promise<boolean> =>
+    this.confirmInChat({ label: git.title, git }, signal, owner);
+
+  private async confirmInChat(
+    card: Pick<PendingEdit, 'label' | 'operation' | 'git'>,
+    signal?: AbortSignal,
+    owner?: string,
+  ): Promise<boolean> {
     const id = ++this.counter;
     const decision = new Promise<boolean>((resolve) => this.decisions.set(id, resolve));
     const onAbort = () => this.resolve(id, false);
     signal?.addEventListener('abort', onAbort);
     try {
       if (signal?.aborted) return false;
-      this.startEmitter.fire({ id, label: operation.from, isNew: false, owner, operation });
+      this.startEmitter.fire({ id, isNew: false, owner, ...card });
       const accepted = await decision;
       this.endEmitter.fire({ id, accepted, owner });
       return accepted;
@@ -82,7 +96,7 @@ export class EditPreview implements vscode.TextDocumentContentProvider {
       signal?.removeEventListener('abort', onAbort);
       this.decisions.delete(id);
     }
-  };
+  }
 
   confirm = async (
     target: vscode.Uri,

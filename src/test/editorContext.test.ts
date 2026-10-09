@@ -41,3 +41,14 @@ test('файл вне проекта, обрезка большого файла
   assert.ok(md.includes('````markdown\n'), 'обрамление длиннее, чем ``` внутри текста');
 });
 
+
+test('текст файла уже приложен — отсылка вместо текста, путь и ошибки остаются', () => {
+  const block = formatEditorContext(
+    { path: 'src/a.ts', inWorkspace: true, languageId: 'typescript', lineCount: 3, fullText: 'СЕКРЕТНЫЙ ТЕКСТ', diagnostics: [{ line: 2, severity: 'ошибка', message: 'нет типа' }] },
+    true,
+  );
+  assert.match(block, /Файл: src\/a\.ts/);
+  assert.match(block, /среди приложенных файлов ниже/);
+  assert.match(block, /строка 2: ошибка: нет типа/);
+  assert.doesNotMatch(block, /СЕКРЕТНЫЙ ТЕКСТ/);
+});

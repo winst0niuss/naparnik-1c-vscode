@@ -462,27 +462,78 @@ button.toggle.on .toggle-dot {
   white-space: nowrap;
 }
 
-/* Заполненность контекста: «Контекст 45%», клик — /compact */
+/* Строка под полем ввода: шкала контекста и ветка git */
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: auto;
+  min-width: 0;
+  font-size: 11px;
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
 button.context-usage {
-  margin-left: auto;
-  align-self: center;
-  padding: 0 4px;
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
   font-size: 11px;
   color: var(--vscode-foreground);
   background: transparent;
   border: none;
-  opacity: 0.65;
-  white-space: nowrap;
 }
 
-button.context-usage:hover {
-  opacity: 1;
+button.context-usage:hover .ctx-value {
   text-decoration: underline;
 }
 
-button.context-usage.warn {
+.ctx-bar {
+  /* Ширина — от ширины панели; не сжимается — при нехватке места обрезается ветка */
+  flex: none;
+  width: clamp(80px, 25vw, 160px);
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--vscode-input-border, var(--vscode-panel-border));
+}
+
+.ctx-fill {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--vscode-textLink-foreground);
+  transition: width 0.3s;
+}
+
+.context-usage.warn .ctx-fill {
+  background: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.context-usage.danger .ctx-fill {
+  background: var(--vscode-editorError-foreground, #f14c4c);
+}
+
+.context-usage.warn {
   color: var(--vscode-editorWarning-foreground, #cca700);
-  opacity: 1;
+}
+
+.context-usage.danger {
+  color: var(--vscode-editorError-foreground, #f14c4c);
+}
+
+.git-branch {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.git-branch::before {
+  content: '| ';
+  opacity: 0.6;
 }
 
 /* Отметка «Контекст сжат»: пересказ свёрнут, клик — развернуть */

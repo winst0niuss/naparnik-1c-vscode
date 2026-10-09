@@ -610,7 +610,7 @@ interface GitApi {
  * Репозиторий проекта через встроенное расширение Git: тот, в котором лежит корень,
  * или единственный внутри корня. Несколько репозиториев внутри — неясно, какой нужен, git не используем
  */
-async function findGitRepository(root: vscode.Uri): Promise<GitRepository | undefined> {
+export async function findGitRepository(root: vscode.Uri): Promise<GitRepository | undefined> {
   try {
     const ext = vscode.extensions.getExtension<{ enabled: boolean; getAPI(version: 1): GitApi }>('vscode.git');
     if (!ext) return undefined;

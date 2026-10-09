@@ -36,8 +36,12 @@ export function contextLabel(s: EditorSnapshot): string {
   return startLine === endLine ? `${name} · строка ${startLine}` : `${name} · строки ${startLine}–${endLine}`;
 }
 
-/** Блок контекста, который добавляется перед вопросом пользователя */
-export function formatEditorContext(s: EditorSnapshot): string {
+/**
+ * Блок контекста, который добавляется перед вопросом пользователя.
+ * textAttached — текст файла уже есть среди приложенных файлов: вместо него отсылка, путь и ошибки остаются
+ * (без отсылки модель не знала, какой файл открыт, и на «в этом файле» отвечала про соседний)
+ */
+export function formatEditorContext(s: EditorSnapshot, textAttached = false): string {
   const lines: string[] = ['[Контекст редактора — файл, открытый у пользователя]'];
   lines.push(
     `Файл: ${s.path} (${s.languageId}, ${s.lineCount} стр.)` +
@@ -49,6 +53,8 @@ export function formatEditorContext(s: EditorSnapshot): string {
     const text = truncate(s.selection.text, MAX_SELECTION_CHARS);
     lines.push(`Пользователь выделил строки ${startLine}–${endLine} — вопрос, скорее всего, о них:`);
     lines.push(fence(text, s.languageId));
+  } else if (textAttached) {
+    lines.push('Текст этого файла — среди приложенных файлов ниже; вопрос, скорее всего, о нём.');
   } else {
     const text = truncate(s.fullText, MAX_FILE_CONTEXT_CHARS);
     lines.push('Текст файла:');

@@ -43,14 +43,14 @@ export class EditorContextTracker implements vscode.Disposable {
   }
 
   /** Подпись для чипа — без чтения текста файла и ошибок (вызывается часто) */
-  describe(): { label: string; path: string } | undefined {
+  describe(): { label: string; path: string; selected: boolean } | undefined {
     const editor = this.editor;
     if (!editor || editor.document.isClosed) return undefined;
     const path = this.pathOf(editor.document);
     const selection = this.selectionLines(editor);
     // Для подписи текст не нужен — передаём пустые поля
     const label = contextLabel({ path, inWorkspace: false, languageId: '', lineCount: 0, fullText: '', diagnostics: [], selection: selection && { ...selection, text: '' } });
-    return { label, path };
+    return { label, path, selected: Boolean(selection) };
   }
 
   /** Снимок для отправки: файл, выделение, текст, ошибки. undefined — открытого файла нет */

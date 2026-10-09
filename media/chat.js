@@ -12,6 +12,7 @@
   const editorChip = document.getElementById('editor-chip');
   const attachmentsEl = document.getElementById('attachments');
   const contextUsageEl = document.getElementById('context-usage');
+  const gitBranchEl = document.getElementById('git-branch');
 
   // Блок ответа, который сейчас стримится
   let currentAnswer = null;
@@ -259,15 +260,13 @@
       chip.title = where + (size ? ' — ' + size : '') + '. Прикладывается к каждому вопросу. Нажмите, чтобы убрать';
       attachmentsEl.appendChild(chip);
     });
-    // Сводка: сколько занято из лимита на всё приложенное к сообщению
-    if (items.length && limit) {
+    // Сводка «занято / лимит» — только при переполнении: заполненность чата показывает шкала под полем ввода
+    const over = Object.values(stats || {}).some((st) => st.notFit);
+    if (items.length && limit && over) {
       const summary = document.createElement('span');
-      const over = Object.values(stats || {}).some((st) => st.notFit);
-      summary.className = 'attachments-summary' + (over ? ' warn' : '');
-      summary.textContent = formatChars(used) + ' / ' + formatChars(limit);
-      summary.title = over
-        ? 'Приложенное не помещается целиком — часть файлов не уйдёт. Наведите на чип, чтобы увидеть, что не поместилось'
-        : 'Символов приложено к вопросу из лимита на одно сообщение';
+      summary.className = 'attachments-summary warn';
+      summary.textContent = 'не помещается в ' + formatChars(limit) + ' символов';
+      summary.title = 'Приложенное не помещается в лимит одного сообщения — часть файлов не уйдёт. Наведите на чип, чтобы увидеть, что не поместилось';
       attachmentsEl.appendChild(summary);
     }
   }
@@ -361,6 +360,11 @@
         break;
       case 'contextUsage':
         renderContextUsage(msg.usage);
+        break;
+      case 'gitBranch':
+        gitBranchEl.classList.toggle('hidden', !msg.name);
+        gitBranchEl.textContent = '⎇ ' + (msg.name || '');
+        gitBranchEl.title = 'Ветка git: ' + (msg.name || '');
         break;
       case 'compactDone':
         // Пересказ показываем свёрнутой отметкой вместо блока ответа
@@ -673,15 +677,18 @@
     el.append(header, body);
   }
 
-  /** Заполненность контекста дискуссии: «Контекст 45%»; клик — сжать */
+  /** Шкала заполненности контекста под полем ввода: «Контекст ▰▰▱▱ 32,1%»; клик — сжать */
   function renderContextUsage(usage) {
-    contextUsageEl.classList.toggle('hidden', !usage);
-    if (!usage) return;
-    const percent = Math.round((usage.tokens / usage.limit) * 100);
+    const percent = usage ? Math.min(100, (usage.tokens / usage.limit) * 100) : 0;
     const k = (n) => Math.round(n / 1000).toLocaleString('ru-RU');
-    contextUsageEl.textContent = 'Контекст ' + percent + '%';
-    contextUsageEl.classList.toggle('warn', percent >= 70);
-    contextUsageEl.title = 'Занято ' + k(usage.tokens) + ' тыс. из ' + k(usage.limit) + ' тыс. токенов. Нажмите, чтобы сжать (/compact)';
+    contextUsageEl.querySelector('.ctx-fill').style.width = percent + '%';
+    contextUsageEl.querySelector('.ctx-value').textContent = usage ? percent.toFixed(1).replace('.', ',') + '%' : '—';
+    // Пороги — как у подсказки (70%) и автосжатия (85%)
+    contextUsageEl.classList.toggle('warn', percent >= 70 && percent < 85);
+    contextUsageEl.classList.toggle('danger', percent >= 85);
+    contextUsageEl.title = usage
+      ? 'Занято ' + k(usage.tokens) + ' тыс. из ' + k(usage.limit) + ' тыс. токенов. Нажмите, чтобы сжать (/compact)'
+      : 'Заполненность контекста появится после ответа Напарника';
   }
 
   function addInfo(markdown) {

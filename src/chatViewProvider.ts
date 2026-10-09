@@ -7,7 +7,7 @@ import { ChatEntry, ChatHistory, SavedChat, createChat, makeTitle } from './chat
 import { AgentCommand, MAX_AGENT_STEPS, buildAgentPrompt, findUnfinishedWrite, stripCommandsForDisplay } from './agent/protocol';
 import { runAgentLoop } from './agent/agentLoop';
 import { INIT_PROMPT, MAKE_RULES_PROMPT, RULES_DIR, SLASH_COMMANDS, helpText, parseSlash } from './slashCommands';
-import { WorkspaceTools } from './agent/workspaceTools';
+import { WorkspaceTools, findGitRepository } from './agent/workspaceTools';
 import { EditPreview, PendingEdit } from './agent/editPreview';
 import { EditorContextTracker } from './editorContextTracker';
 import { contextLabel, formatEditorContext } from './agent/editorContext';
@@ -137,6 +137,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private mentionIndex: { root: string; at: number; paths: Promise<string[]> } | undefined;
   // Номер последнего расчёта объёма чипов — устаревший результат не показываем
   private statsSeq = 0;
+  // Ветка git под полем ввода: текущая и подписка на её смену
+  private gitBranch: string | undefined;
+  private gitWatching: Promise<void> | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -155,6 +158,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.editorContextUri = uri;
       this.postEditorContext();
     });
+    // В недоверенной папке Git выключен — ветку покажем, когда папке доверятся
+    vscode.workspace.onDidGrantWorkspaceTrust(() => void this.watchGitBranch());
     // Карточка правки — только в чате, где её предложили: иначе Enter в другом чате применил бы чужую правку
     preview.onDidStart((edit) => {
       this.pendingEdits.set(edit.id, edit);
@@ -264,6 +269,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private renderCurrentChat(): void {
     this.post({ type: 'restore', history: this.chat.entries });
+    // Чипы у каждого чата свои — от них зависит, нужен ли чип редактора
+    this.postEditorContext();
     this.post({ type: 'contextUsage', usage: this.chat.contextUsage ?? null });
     this.postAttachments();
     const run = this.running.get(this.chat.id);
@@ -290,6 +297,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Чипы — часть чата: переживают переключение и перезапуск; время чата не меняем — порядок истории тот же
     void this.history.save(this.chat, false);
     this.postAttachments();
+    // Открытый файл могли приложить или убрать — чип редактора показывается или прячется
+    this.postEditorContext();
+  }
+
+  /**
+   * Открытый файл уже приложен чипом — чип редактора лишний (при отправке его текст тоже не повторяется).
+   * Выделение — не дубль: это фокус вопроса, его оставляем
+   */
+  private editorFileAttached(selected: boolean): boolean {
+    const rel = this.editorRelativePath();
+    return !selected && rel !== undefined && this.attachments.includes(rel);
+  }
+
+  /** Путь открытого файла от корня проекта, как у чипов; undefined — нет файла или он вне проекта */
+  private editorRelativePath(): string | undefined {
+    const uri = this.editorContext.uri;
+    return (uri && this.relativePath(uri)) || undefined;
   }
 
   /** Путь от корня проекта; undefined — файл вне проекта, '' — сам корень */
@@ -378,10 +402,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
 
+  /** Ветка git проекта под полем ввода — через встроенное расширение Git, обновляется при смене ветки */
+  private watchGitBranch(): Promise<void> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!root || this.gitWatching) return this.gitWatching ?? Promise.resolve();
+    this.gitWatching = (async () => {
+      const repo = await findGitRepository(root);
+      if (!repo) {
+        // Не git или Git выключен — попробуем снова при следующем открытии панели
+        this.gitWatching = undefined;
+        return;
+      }
+      const update = () => {
+        const head = repo.state.HEAD;
+        // Отсоединённый HEAD — короткий хеш коммита
+        const branch = head?.name ?? head?.commit?.slice(0, 7);
+        // Состояние меняется и без смены ветки (изменения файлов) — шлём только новую ветку
+        if (branch === this.gitBranch) return;
+        this.gitBranch = branch;
+        this.post({ type: 'gitBranch', name: branch ?? null });
+      };
+      repo.state.onDidChange?.(update);
+      update();
+    })();
+    return this.gitWatching;
+  }
+
   /** Чип над полем ввода: какой файл и выделение будут приложены к следующему сообщению */
   private postEditorContext(): void {
     const info = this.editorContext.describe();
-    this.post({ type: 'editorContext', label: info?.label ?? null, path: info?.path, enabled: !this.editorContextOff });
+    const shown = info && !this.editorFileAttached(info.selected) ? info : undefined;
+    this.post({ type: 'editorContext', label: shown?.label ?? null, path: shown?.path, enabled: !this.editorContextOff });
   }
 
   async refreshTokenState(): Promise<void> {
@@ -639,6 +690,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     switch (msg.type) {
       case 'ready':
         this.post({ type: 'commands', list: SLASH_COMMANDS });
+        this.post({ type: 'gitBranch', name: this.gitBranch ?? null });
+        void this.watchGitBranch();
         this.postEditorContext();
         this.renderCurrentChat();
         this.postProjectState();
@@ -821,17 +874,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Запоминаем чат: пользователь может переключиться, а ответ должен попасть сюда
     const chat = this.chat;
 
-    // Снимок редактора берём сразу: пока ждём ответа, пользователь может переключить файл
-    const useEditor = withEditorContext === 'force' || (withEditorContext && !this.editorContextOff);
-    const editorSnap = useEditor ? this.editorContext.snapshot() : undefined;
     // @-упоминания и чипы — только к вопросу пользователя, не к развёрнутым инструкциям /init и /import.
     // Чипы остаются после отправки, пока пользователь не уберёт их сам; у каждого чата свои
     const attached = modelText === undefined ? [...(chat.attachments ?? [])] : [];
+    // Снимок редактора берём сразу: пока ждём ответа, пользователь может переключить файл
+    const useEditor = withEditorContext === 'force' || (withEditorContext && !this.editorContextOff);
+    const editorSnap = useEditor ? this.editorContext.snapshot() : undefined;
+    const editorPath = editorSnap && this.editorRelativePath();
     const mentioned = modelText === undefined ? await this.resolveMentions(text, attached) : undefined;
-    const context = [editorSnap ? `📄 ${contextLabel(editorSnap)}` : undefined, mentioned?.label].filter(Boolean).join(' · ') || undefined;
+    // Открытый файл уже приложен целиком (чипом, папкой или @-упоминанием) — второй раз его текст не шлём,
+    // только отсылку. Не поместился в лимит — текст остаётся в контексте редактора, иначе файл не дошёл бы вовсе
+    const editorTextAttached = Boolean(editorSnap && !editorSnap.selection && editorPath && mentioned?.shownFiles.has(editorPath));
+    // В подписи под вопросом файл и так есть среди приложенного
+    const editorLabel = editorSnap && !editorTextAttached ? `📄 ${contextLabel(editorSnap)}` : undefined;
+    const context = [editorLabel, mentioned?.label].filter(Boolean).join(' · ') || undefined;
 
     // Вопрос не поместится в контекст — сервер молча выбросил бы начало чата. Сжимаем заранее
-    const messageChars = (modelText ?? text).length + (mentioned?.block.length ?? 0) + (editorSnap ? formatEditorContext(editorSnap).length : 0);
+    const messageChars = (modelText ?? text).length + (mentioned?.block.length ?? 0) + (editorSnap ? formatEditorContext(editorSnap, editorTextAttached).length : 0);
     if (readSettings().autoCompact && !chat.compactSummary && needsAutoCompact(chat.contextUsage, messageChars)) {
       // Остановили сжатие — не отправляем; не вышло — отправляем как есть
       if ((await this.compact(chat, '', true)) === 'aborted') return false;
@@ -883,7 +942,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         : undefined;
       // Контекст редактора — перед вопросом: модель сразу видит, о каком файле и фрагменте речь.
       // Тот же неизменённый файл повторно не шлём — модель уже видела его в этом чате
-      let editorBlock = editorSnap ? formatEditorContext(editorSnap) : '';
+      let editorBlock = editorSnap ? formatEditorContext(editorSnap, editorTextAttached) : '';
       // В истории храним хеш, а не сам текст файла — чтобы история чатов не разрасталась
       const editorHash = editorBlock ? createHash('sha1').update(editorBlock).digest('hex') : undefined;
       if (editorHash && editorHash === chat.lastEditorContext) {
@@ -1024,7 +1083,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async resolveMentions(
     text: string,
     attached: string[] = [],
-  ): Promise<{ block: string; selection: string; label: string; overflowFolders: string[]; notes: string[] } | undefined> {
+  ): Promise<{ block: string; selection: string; label: string; overflowFolders: string[]; notes: string[]; shownFiles: Set<string> } | undefined> {
     const ctx = await this.gatherContext(text, attached);
     if (!ctx) return undefined;
     const isShown = (key: string) => ctx.shownChars.has(attachmentLabel(key));
@@ -1038,8 +1097,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const f = parseFragment(unique[i]);
       return f ? `✂️ ${name}:${f.from}–${f.to}` : unique[i].endsWith('/') ? `📁 ${name}` : `📄 ${name}`;
     });
-    if (!ctx.block) return { block: '', selection: '', label: '', overflowFolders: [], notes: ctx.notes };
-    return { block: ctx.block, selection: formatSelection(unique), label: names.join(', '), overflowFolders: ctx.overflowFolders, notes: ctx.notes };
+    if (!ctx.block) return { block: '', selection: '', label: '', overflowFolders: [], notes: ctx.notes, shownFiles: new Set() };
+    // Ключи приложенного: файл целиком — его путь, фрагмент — «путь (строки …)»
+    const shownFiles = new Set(ctx.shownChars.keys());
+    return { block: ctx.block, selection: formatSelection(unique), label: names.join(', '), overflowFolders: ctx.overflowFolders, notes: ctx.notes, shownFiles };
   }
 
   /** Читает упомянутое и приложенное и раскладывает по лимитам — как уйдёт модели */
@@ -1202,11 +1263,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </button>
       <span id="attachments" class="attachments"></span>
       <button type="button" id="editor-chip" class="chip hidden" title=""></button>
-      <button type="button" id="context-usage" class="context-usage hidden"></button>
     </div>
     <div id="slash-menu" class="slash-menu hidden" role="listbox"></div>
     <textarea id="input" rows="3" placeholder="Задай мне вопрос."></textarea>
     <div class="actions">
+      <div class="status-line">
+        <button type="button" id="context-usage" class="context-usage"><span>Контекст</span><span class="ctx-bar"><span class="ctx-fill"></span></span><span class="ctx-value">—</span></button>
+        <span id="git-branch" class="git-branch hidden"></span>
+      </div>
       <button type="button" id="stop" class="secondary hidden">Стоп</button>
       <button type="submit" id="send">Отправить</button>
     </div>

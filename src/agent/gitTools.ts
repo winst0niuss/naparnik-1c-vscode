@@ -41,6 +41,8 @@ export interface GitRepository {
     readonly workingTreeChanges: readonly GitChange[];
     /** Есть в новых версиях VS Code при настройке git.untrackedChanges = separate */
     readonly untrackedChanges?: readonly GitChange[];
+    /** Состояние изменилось (смена ветки, коммит) — для ветки под полем ввода */
+    readonly onDidChange?: (listener: () => void) => { dispose(): void };
   };
   status(): Promise<void>;
   diff(cached?: boolean): Promise<string>;

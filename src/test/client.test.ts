@@ -397,3 +397,85 @@ test('сервер сам закрыл вызов инструмента и от
     mock.close();
   }
 });
+
+test('heartbeat не продлевает ожидание: завис с «: heartbeat» — таймаут', async () => {
+  const server = createServer(async (req, res) => {
+    for await (const _ of req);
+    res.setHeader('Content-Type', 'text/event-stream');
+    // Сервер «жив» (heartbeat каждые 50 мс), но событий нет дольше таймаута
+    const timer = setInterval(() => !res.destroyed && res.write(': heartbeat\n\n'), 50);
+    res.on('close', () => clearInterval(timer));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const client = new NaparnikClient({ token: 't', baseUrl: `http://127.0.0.1:${port}`, authFormat: 'plain', skillName: 'raw', timeoutMs: 300 });
+  try {
+    await assert.rejects(client.sendMessage('c', 'q', undefined, { onText: () => {} }), (e: Error) => e.name === 'TimeoutError');
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('сервер завис после подтверждения инструмента: просим продолжить от последнего ответа', async () => {
+  const bodies: any[] = [];
+  const server = createServer(async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    const body = JSON.parse(raw);
+    bodies.push(body);
+    res.setHeader('Content-Type', 'text/event-stream');
+    const send = (e: object) => res.write(`data: ${JSON.stringify(e)}\n\n`);
+    if (bodies.length === 1) {
+      send({ role: 'assistant', uuid: 'a-1', content: { tool_calls: [{ id: 't-1', function: { name: 'TodoWrite', arguments: '{}' } }] }, finished: true });
+      res.end();
+    } else if (body.role === 'tool') {
+      // Выполнение плана зависло: только heartbeat
+      const timer = setInterval(() => !res.destroyed && res.write(': heartbeat\n\n'), 50);
+      res.on('close', () => clearInterval(timer));
+    } else {
+      send({ role: 'assistant', uuid: 'a-2', content: { content: 'Готово' }, finished: true });
+      res.end();
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const client = new NaparnikClient({ token: 't', baseUrl: `http://127.0.0.1:${port}`, authFormat: 'plain', skillName: 'raw', timeoutMs: 300 });
+  try {
+    const answer = await client.sendMessage('c', 'q', undefined, { onText: () => {}, continueHint: 'продолжай' });
+    assert.equal(answer.text, 'Готово');
+    assert.deepEqual(bodies.map((b) => b.role), ['user', 'tool', 'user']);
+    assert.equal(bodies[2].parent_uuid, 'a-1');
+    assert.equal(bodies[2].content.content.instruction, 'продолжай');
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('остановка пользователем во время выполнения инструмента — без повторов', async () => {
+  let calls = 0;
+  const server = createServer(async (req, res) => {
+    for await (const _ of req);
+    calls++;
+    res.setHeader('Content-Type', 'text/event-stream');
+    if (calls === 1) {
+      res.end(`data: ${JSON.stringify({ role: 'assistant', uuid: 'a-1', content: { tool_calls: [{ id: 't-1', function: { name: 'TodoWrite' } }] }, finished: true })}\n\n`);
+    } else {
+      const timer = setInterval(() => !res.destroyed && res.write(': heartbeat\n\n'), 50);
+      res.on('close', () => clearInterval(timer));
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const client = new NaparnikClient({ token: 't', baseUrl: `http://127.0.0.1:${port}`, authFormat: 'plain', skillName: 'raw', timeoutMs: 5000 });
+  const ctl = new AbortController();
+  setTimeout(() => ctl.abort(), 300);
+  try {
+    await assert.rejects(client.sendMessage('c', 'q', undefined, { onText: () => {} }, ctl.signal));
+    assert.equal(calls, 2);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});

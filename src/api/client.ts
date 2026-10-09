@@ -156,6 +156,8 @@ export class NaparnikClient {
     };
     let continueRequests = 0;
     let idleRounds = 0;
+    // Отправлен ответ на tool_calls — сервер выполняет инструменты
+    let toolsAcked = false;
     const seenCalls = new Set<string>();
     // Последний ответ ассистента в этом обмене — от него можно продолжить, не теряя вопрос пользователя
     let lastAssistantUuid: string | undefined;
@@ -171,6 +173,7 @@ export class NaparnikClient {
           : { parent_uuid: parentUuid ?? null, role: 'user', content: { content: { instruction: `${message}\n\n${hint}` } } };
       continueRequests++;
       idleRounds = 0;
+      toolsAcked = false;
       return true;
     };
 
@@ -182,6 +185,10 @@ export class NaparnikClient {
         // Сервер изредка сам закрывает вызов инструмента (наблюдалось с WriteSystemFile) и отвергает наш ответ на него
         // («No tool calls found in the previous assistant message») — просим продолжить от того же ответа
         if (err instanceof ApiError && err.status === 422 && err.message.includes('No tool calls found') && askToContinue(lastAssistantUuid)) continue;
+        // Сервер завис, выполняя инструмент (живой API: TodoWrite после отклонённых ReadResource), — просим продолжить
+        // от последнего ответа. Остановку пользователем и зависание обычного ответа не трогаем
+        const timedOut = err instanceof Error && err.name === 'TimeoutError' && !signal?.aborted;
+        if (timedOut && toolsAcked && askToContinue(lastAssistantUuid)) continue;
         throw err;
       }
       // Вызовы без id сервер создаёт, когда принимает текст модели за вызов инструмента
@@ -237,6 +244,7 @@ export class NaparnikClient {
         continue;
       }
 
+      toolsAcked = true;
       payload = {
         parent_uuid: result.assistantUuid,
         role: 'tool',
@@ -284,11 +292,13 @@ export class NaparnikClient {
 
     // Читаем поток кусками и режем на строки: кусок может оборваться посреди строки
     for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
-      idle.reset();
       buffer += decoder.decode(chunk, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
       for (const line of lines) {
+        // Таймер продлевают только события: «: heartbeat» сервер шлёт и тогда, когда сам завис
+        // (живой API: /init висел 26+ минут после TodoWrite — таймаут не срабатывал)
+        if (line.startsWith('data: ')) idle.reset();
         parser.feedLine(line.replace(/\r$/, ''));
       }
       callbacks.onText(parser.visibleText);

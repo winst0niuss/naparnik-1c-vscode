@@ -604,7 +604,10 @@ export function looksLikeMalformedEdit(text: string): boolean {
  */
 export function emulatedCommand(call: { function?: { name?: string; arguments?: string } }): AgentCommand | undefined {
   const name = call.function?.name;
-  if (name !== 'ReadSystemFile' && name !== 'WriteSystemFile') return undefined;
+  // ReadResource модель вызывает с путями проекта: «attachment://playwright/package.json», «memory://CLAUDE.md»
+  // (живой API, /init: 19 отказов за запрос, CLAUDE.md — 15 раз подряд)
+  const read = name === 'ReadSystemFile' || name === 'ReadResource';
+  if (!read && name !== 'WriteSystemFile') return undefined;
   let args: { path?: unknown; file_path?: unknown; content?: unknown };
   try {
     args = JSON.parse(call.function?.arguments ?? '');
@@ -615,7 +618,7 @@ export function emulatedCommand(call: { function?: { name?: string; arguments?: 
   const path = typeof raw === 'string' ? raw.replace(/^[a-z]+:\/\//i, '').trim() : '';
   // Путь-UUID — идентификатор вложения сервера, а не файл проекта
   if (!path || /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(path)) return undefined;
-  if (name === 'ReadSystemFile') return { kind: 'read_file', path };
+  if (read) return { kind: 'read_file', path };
   return typeof args.content === 'string' ? { kind: 'create_file', path, content: args.content } : undefined;
 }
 

@@ -259,6 +259,9 @@ test('ReadSystemFile и WriteSystemFile выполняются как @-кома
   const call = (name: string, args: object | string) => ({ function: { name, arguments: typeof args === 'string' ? args : JSON.stringify(args) } });
   assert.deepEqual(emulatedCommand(call('ReadSystemFile', { path: 'attachment://README.md' })), { kind: 'read_file', path: 'README.md' });
   assert.deepEqual(emulatedCommand(call('ReadSystemFile', { file_path: 'src/a.bsl' })), { kind: 'read_file', path: 'src/a.bsl' });
+  // ReadResource — с путями проекта под разными схемами (живой API, /init)
+  assert.deepEqual(emulatedCommand(call('ReadResource', { path: 'memory://CLAUDE.md' })), { kind: 'read_file', path: 'CLAUDE.md' });
+  assert.deepEqual(emulatedCommand(call('ReadResource', { path: 'attachment://playwright/package.json' })), { kind: 'read_file', path: 'playwright/package.json' });
   assert.equal(emulatedCommand(call('ReadSystemFile', 'не json')), undefined);
   assert.equal(emulatedCommand(call('ReadSystemFile', { path: '129a6f8e-8537-4e9e-9b4d-0a36ea6d37ee' })), undefined);
   assert.deepEqual(emulatedCommand(call('WriteSystemFile', { path: 'NAPARNIK.md', content: '# Проект' })), { kind: 'create_file', path: 'NAPARNIK.md', content: '# Проект' });

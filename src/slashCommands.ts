@@ -11,6 +11,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'rules', description: 'Правила проекта из папки .rules: открыть или создать' },
   { name: 'make-rules', description: 'Записать в .rules правила и договорённости из этого чата' },
   { name: 'import', description: 'Перенести в .rules инструкции Claude Code, Codex, Gemini, Cursor, Copilot, Windsurf; без аргументов — показать найденное', args: '[инструменты]' },
+  { name: 'compact', description: 'Сжать контекст: заменить историю чата пересказом', args: '[что сохранить]' },
   { name: 'clear', description: 'Новый чат с чистым контекстом' },
   { name: 'history', description: 'История чатов' },
   { name: 'project', description: 'Включить или выключить доступ к проекту' },

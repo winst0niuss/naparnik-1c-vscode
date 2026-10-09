@@ -11,6 +11,7 @@
   const projectToggle = document.getElementById('project-toggle');
   const editorChip = document.getElementById('editor-chip');
   const attachmentsEl = document.getElementById('attachments');
+  const contextUsageEl = document.getElementById('context-usage');
 
   // Блок ответа, который сейчас стримится
   let currentAnswer = null;
@@ -313,6 +314,8 @@
     vscode.postMessage({ type: 'dropUris', uris });
   });
 
+  contextUsageEl.addEventListener('click', () => vscode.postMessage({ type: 'send', text: '/compact' }));
+
   document.getElementById('set-token').addEventListener('click', () => vscode.postMessage({ type: 'setToken' }));
 
   // Кнопки у блоков кода — через делегирование, блоки создаются динамически
@@ -341,6 +344,7 @@
           if (entry.role === 'user') addUser(entry.text, entry.context);
           else if (entry.role === 'assistant') addMessage('assistant').innerHTML = renderMarkdown(entry.text);
           else if (entry.role === 'step') addStep(entry.text);
+          else if (entry.role === 'compact') addCompact(entry);
           else addError(entry.text);
         }
         closeStepGroups();
@@ -354,6 +358,16 @@
         editorChip.title = msg.enabled
           ? 'Файл ' + msg.path + ' будет приложен к сообщению. Нажмите, чтобы не прикладывать'
           : 'Файл не прикладывается. Нажмите, чтобы приложить';
+        break;
+      case 'contextUsage':
+        renderContextUsage(msg.usage);
+        break;
+      case 'compactDone':
+        // Пересказ показываем свёрнутой отметкой вместо блока ответа
+        currentAnswer?.remove();
+        currentAnswer = null;
+        addCompact(msg.entry);
+        finishAnswer();
         break;
       case 'attachments':
         renderAttachments(msg.items || [], msg.stats, msg.used, msg.limit);
@@ -469,7 +483,7 @@
         currentAnswer = addMessage('assistant');
         currentStatus = createStatus();
         currentAnswer.appendChild(currentStatus);
-        setStatus('Напарник думает', THINK_FRAMES);
+        setStatus(msg.status || 'Напарник думает', THINK_FRAMES);
         break;
       case 'toolCalls':
         if (!currentStatus) break;
@@ -643,6 +657,31 @@
     const viewed = parts.length > 0 ? 'Просмотрено: ' + parts.join(', ') : '';
     const proposed = edits > 0 ? 'предложено правок: ' + edits : '';
     return [viewed, proposed].filter(Boolean).join('; ').replace(/^п/, 'П') || steps.length + ' ' + plural(steps.length, 'шаг', 'шага', 'шагов');
+  }
+
+  /** Отметка «Контекст сжат»: клик раскрывает пересказ, которым заменили историю */
+  function addCompact(entry) {
+    const el = addMessage('compact');
+    const header = document.createElement('div');
+    header.className = 'compact-header';
+    header.innerHTML = '<span class="steps-arrow">▸</span><span></span>';
+    header.lastChild.textContent = '🗜️ Контекст сжат' + (entry.context ? ' · ' + entry.context : '') + ' — Напарник продолжит по пересказу';
+    const body = document.createElement('div');
+    body.className = 'compact-body';
+    body.innerHTML = renderMarkdown(entry.text);
+    header.addEventListener('click', () => el.classList.toggle('expanded'));
+    el.append(header, body);
+  }
+
+  /** Заполненность контекста дискуссии: «Контекст 45%»; клик — сжать */
+  function renderContextUsage(usage) {
+    contextUsageEl.classList.toggle('hidden', !usage);
+    if (!usage) return;
+    const percent = Math.round((usage.tokens / usage.limit) * 100);
+    const k = (n) => Math.round(n / 1000).toLocaleString('ru-RU');
+    contextUsageEl.textContent = 'Контекст ' + percent + '%';
+    contextUsageEl.classList.toggle('warn', percent >= 70);
+    contextUsageEl.title = 'Занято ' + k(usage.tokens) + ' тыс. из ' + k(usage.limit) + ' тыс. токенов. Нажмите, чтобы сжать (/compact)';
   }
 
   function addInfo(markdown) {

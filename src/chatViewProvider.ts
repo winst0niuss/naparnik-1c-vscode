@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import { ApiError, NaparnikClient } from './api/client';
 import { TokenStore } from './tokenStore';
-import { ChatHistory, SavedChat, createChat, makeTitle } from './chatHistory';
+import { ChatEntry, ChatHistory, SavedChat, createChat, makeTitle } from './chatHistory';
 import { AgentCommand, MAX_AGENT_STEPS, buildAgentPrompt, findUnfinishedWrite, stripCommandsForDisplay } from './agent/protocol';
 import { runAgentLoop } from './agent/agentLoop';
 import { INIT_PROMPT, MAKE_RULES_PROMPT, RULES_DIR, SLASH_COMMANDS, helpText, parseSlash } from './slashCommands';
@@ -45,6 +45,17 @@ import {
   withFolders,
 } from './agent/mentions';
 import { FolderReadTools } from './agent/folderReadTools';
+import {
+  COMPACT_HINT_RATIO,
+  buildTranscript,
+  compactPrompt,
+  compactTranscriptPrompt,
+  contextPercent,
+  isUsableSummary,
+  needsAutoCompact,
+  summaryBlock,
+  userMessages,
+} from './agent/compact';
 
 /** /init выполнен, только если NAPARNIK.md создан или изменён */
 function initDone(executed: AgentCommand[]): string | undefined {
@@ -253,6 +264,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private renderCurrentChat(): void {
     this.post({ type: 'restore', history: this.chat.entries });
+    this.post({ type: 'contextUsage', usage: this.chat.contextUsage ?? null });
     this.postAttachments();
     const run = this.running.get(this.chat.id);
     if (run) {
@@ -465,6 +477,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'rules':
         await this.showRules();
+        break;
+      case 'compact':
+        await this.compactCommand(slash.args);
         break;
       case 'import':
         await this.importRules(slash.args);
@@ -682,6 +697,98 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** /compact [что сохранить] — проверки перед сжатием */
+  private async compactCommand(instructions: string): Promise<void> {
+    const chat = this.chat;
+    if (this.running.has(chat.id)) {
+      this.info('Напарник ещё отвечает в этом чате. Дождитесь ответа или остановите его — `/stop`.');
+    } else if (!chat.entries.some((e) => e.role === 'assistant')) {
+      this.info('Сжимать пока нечего: в этом чате ещё не было ответов.');
+    } else if (chat.compactSummary && !chat.lastAssistantUuid) {
+      this.info('Контекст уже сжат — пересказ уйдёт со следующим вопросом.');
+    } else {
+      await this.compact(chat, instructions);
+    }
+  }
+
+  /**
+   * Сжать контекст: модель пересказывает разговор, пересказ уйдёт первым сообщением новой дискуссии
+   * со следующим вопросом. Сначала пересказ просим в той же дискуссии — модель помнит прочитанные файлы;
+   * не вышло (ошибка, отказ, дискуссии нет) — по записи разговора из истории чата в новой дискуссии
+   */
+  private async compact(chat: SavedChat, instructions: string, auto = false): Promise<'done' | 'failed' | 'aborted'> {
+    const token = await this.tokens.get();
+    if (!token) {
+      this.post({ type: 'tokenState', hasToken: false });
+      return 'failed';
+    }
+    const run: RunningRequest = { chat, abort: new AbortController(), partial: '' };
+    this.running.set(chat.id, run);
+    const postIfVisible = (message: object) => {
+      if (this.chat === chat) this.post(message);
+    };
+    const signal = run.abort.signal;
+    postIfVisible({ type: 'assistantStart', status: 'Сжимаю контекст' });
+    const callbacks = {
+      onText: (text: string) => {
+        run.partial = text;
+        postIfVisible({ type: 'assistantText', text });
+      },
+      onToolCalls: (names: string[]) => {
+        run.toolNames = names;
+        postIfVisible({ type: 'toolCalls', names });
+      },
+    };
+    try {
+      const client = new NaparnikClient({ token, ...readSettings() });
+      let summary = '';
+      let fromTranscript = false;
+      // Начало разговора сервис уже отбросил — в той же дискуссии модель его не помнит, пересказываем по записи
+      if (chat.conversationId && chat.lastAssistantUuid && !chat.contextTruncated) {
+        summary = await client
+          .sendMessage(chat.conversationId, compactPrompt(instructions, userMessages(chat.entries)), chat.lastAssistantUuid, callbacks, signal)
+          .then((a) => a.text)
+          .catch((err) => {
+            if (signal.aborted) throw err;
+            return '';
+          });
+      }
+      if (!isUsableSummary(summary)) {
+        fromTranscript = true;
+        callbacks.onText('');
+        const conversationId = await client.createConversation(signal);
+        summary = (await client.sendMessage(conversationId, compactTranscriptPrompt(buildTranscript(chat.entries), instructions), undefined, callbacks, signal)).text;
+      }
+      if (!isUsableSummary(summary)) throw new Error('Напарник не составил пересказ — контекст не сжат.');
+
+      const notes = [auto ? 'автоматически' : '', chat.contextUsage ? `было заполнено ${contextPercent(chat.contextUsage)}%` : '', fromTranscript ? 'по записи разговора' : ''];
+      Object.assign(chat, {
+        conversationId: undefined,
+        lastAssistantUuid: undefined,
+        agentPrimed: false,
+        agentPaused: false,
+        lastEditorContext: undefined,
+        lastAttachments: undefined,
+        compactSummary: summary,
+        contextUsage: undefined,
+        contextHinted: false,
+        contextTruncated: false,
+      });
+      const entry: ChatEntry = { role: 'compact', text: summary, context: notes.filter(Boolean).join(' · ') || undefined };
+      chat.entries.push(entry);
+      postIfVisible({ type: 'compactDone', entry });
+      postIfVisible({ type: 'contextUsage', usage: null });
+      return 'done';
+    } catch (err) {
+      // Состояние чата не меняли — продолжаем в прежней дискуссии
+      postIfVisible({ type: 'error', message: signal.aborted ? 'Сжатие остановлено' : `Не удалось сжать контекст: ${errorMessage(err)}` });
+      return signal.aborted ? 'aborted' : 'failed';
+    } finally {
+      this.running.delete(chat.id);
+      if (this.history.list().some((c) => c.id === chat.id)) await this.history.save(chat, false);
+    }
+  }
+
   /**
    * Отправить вопрос. text — то, что видит пользователь в чате и истории;
    * modelText — что уходит модели (для /init, /make-rules и /import это развёрнутая инструкция).
@@ -711,20 +818,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.post({ type: 'tokenState', hasToken: false });
       return false;
     }
+    // Запоминаем чат: пользователь может переключиться, а ответ должен попасть сюда
+    const chat = this.chat;
 
     // Снимок редактора берём сразу: пока ждём ответа, пользователь может переключить файл
     const useEditor = withEditorContext === 'force' || (withEditorContext && !this.editorContextOff);
     const editorSnap = useEditor ? this.editorContext.snapshot() : undefined;
     // @-упоминания и чипы — только к вопросу пользователя, не к развёрнутым инструкциям /init и /import.
     // Чипы остаются после отправки, пока пользователь не уберёт их сам; у каждого чата свои
-    const attached = modelText === undefined ? [...this.attachments] : [];
+    const attached = modelText === undefined ? [...(chat.attachments ?? [])] : [];
     const mentioned = modelText === undefined ? await this.resolveMentions(text, attached) : undefined;
     const context = [editorSnap ? `📄 ${contextLabel(editorSnap)}` : undefined, mentioned?.label].filter(Boolean).join(' · ') || undefined;
 
-    // Запоминаем чат: пользователь может переключиться, а ответ должен попасть сюда
-    const chat = this.chat;
+    // Вопрос не поместится в контекст — сервер молча выбросил бы начало чата. Сжимаем заранее
+    const messageChars = (modelText ?? text).length + (mentioned?.block.length ?? 0) + (editorSnap ? formatEditorContext(editorSnap).length : 0);
+    if (readSettings().autoCompact && !chat.compactSummary && needsAutoCompact(chat.contextUsage, messageChars)) {
+      // Остановили сжатие — не отправляем; не вышло — отправляем как есть
+      if ((await this.compact(chat, '', true)) === 'aborted') return false;
+      if (this.running.has(chat.id)) return false;
+    }
     // Состояние дискуссии до запроса: после ошибки или «Стоп» продолжаем от последнего полного ответа
-    const before = { lastAssistantUuid: chat.lastAssistantUuid, agentPrimed: chat.agentPrimed, agentPaused: chat.agentPaused, lastEditorContext: chat.lastEditorContext, lastAttachments: chat.lastAttachments };
+    const before = {
+      lastAssistantUuid: chat.lastAssistantUuid,
+      agentPrimed: chat.agentPrimed,
+      agentPaused: chat.agentPaused,
+      lastEditorContext: chat.lastEditorContext,
+      lastAttachments: chat.lastAttachments,
+      compactSummary: chat.compactSummary,
+      contextUsage: chat.contextUsage,
+    };
     if (chat.entries.length === 0) {
       chat.title = makeTitle(text);
     }
@@ -783,7 +905,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const workspace = !tools && overflow.length ? WorkspaceTools.forCurrentWorkspace(this.preview.confirm, run.abort.signal, chat.id, this.preview.confirmOperation) : undefined;
       const folderTools = workspace ? new FolderReadTools(workspace, overflow) : undefined;
       const readHint = tools || folderTools ? overflowReadHint(overflow, Boolean(tools)) : '';
-      const question = [editorBlock, filesBlock, readHint, mentioned?.selection, modelText ?? text].filter(Boolean).join('\n\n');
+      // После /compact — пересказ прежнего разговора первым в новой дискуссии
+      const summary = chat.compactSummary ? summaryBlock(chat.compactSummary) : '';
+      const question = [summary, editorBlock, filesBlock, readHint, mentioned?.selection, modelText ?? text].filter(Boolean).join('\n\n');
       let message = question;
       if (tools && !chat.agentPrimed) {
         // Первое сообщение с доступом к проекту: инструкция по командам, дерево, документация и правила
@@ -839,8 +963,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         },
       });
       chat.lastAssistantUuid = answer.assistantUuid;
+      chat.compactSummary = undefined;
+      chat.contextUsage = answer.usage;
       chat.entries.push({ role: 'assistant', text: answer.text });
       postIfVisible({ type: 'assistantDone', text: answer.text });
+      postIfVisible({ type: 'contextUsage', usage: answer.usage ?? null });
+      // Ветка дискуссии только растёт; стала меньше — сервис молча отбросил начало разговора (живой API)
+      if (answer.usage && before.contextUsage && answer.usage.tokens < before.contextUsage.tokens && !chat.contextTruncated) {
+        chat.contextTruncated = true;
+        postIfVisible({
+          type: 'info',
+          text: '⚠️ Контекст чата переполнился, и сервис отбросил начало разговора — Напарник его больше не помнит. Сожмите контекст — `/compact`: пересказ составится по записи всего чата.',
+        });
+      } else if (answer.usage && answer.usage.tokens >= answer.usage.limit * COMPACT_HINT_RATIO && !chat.contextHinted) {
+        chat.contextHinted = true;
+        const auto = readSettings().autoCompact ? ' Когда место закончится, Напарник сожмёт его сам.' : '';
+        postIfVisible({
+          type: 'info',
+          text: `Контекст чата заполнен на ${contextPercent(answer.usage)}%.${auto} Сжать сейчас — \`/compact\` (можно с уточнением, что сохранить), начать заново — \`/clear\`.`,
+        });
+      }
       this.notifyIfHidden(chat);
       return true;
     } catch (err) {
@@ -853,7 +995,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       Object.assign(chat, before);
       // Сервер отверг запрос к дискуссии (не токен и не лимит частоты) — она могла испортиться, начинаем новую
       if (err instanceof ApiError && err.status >= 400 && err.status < 500 && ![401, 403, 429].includes(err.status)) {
-        Object.assign(chat, { conversationId: undefined, lastAssistantUuid: undefined, agentPrimed: false, agentPaused: false, lastEditorContext: undefined, lastAttachments: undefined });
+        Object.assign(chat, { conversationId: undefined, lastAssistantUuid: undefined, agentPrimed: false, agentPaused: false, lastEditorContext: undefined, lastAttachments: undefined, contextUsage: undefined, contextTruncated: false });
       }
       return false;
     } finally {
@@ -1060,6 +1202,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </button>
       <span id="attachments" class="attachments"></span>
       <button type="button" id="editor-chip" class="chip hidden" title=""></button>
+      <button type="button" id="context-usage" class="context-usage hidden"></button>
     </div>
     <div id="slash-menu" class="slash-menu hidden" role="listbox"></div>
     <textarea id="input" rows="3" placeholder="Задай мне вопрос."></textarea>
@@ -1085,6 +1228,7 @@ function readSettings() {
     authFormat: cfg.get<'plain' | 'bearer'>('authFormat', 'plain'),
     skillName: cfg.get<string>('skillName', 'custom'),
     timeoutMs: cfg.get<number>('timeoutSeconds', 300) * 1000,
+    autoCompact: cfg.get<boolean>('autoCompact', true),
   };
 }
 

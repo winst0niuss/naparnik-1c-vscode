@@ -85,3 +85,22 @@ test('thinking-теги вырезаются, незакрытый скрыва�
   assert.equal(stripThinkingTags('<think>скрыто</think>Ответ'), 'Ответ');
   assert.equal(stripThinkingTags('Ответ<thinking>пишется...', true), 'Ответ');
 });
+
+test('заполненность контекста — из details финального события ассистента', () => {
+  const details = (tokens: number | null) => ({ usage: tokens === null ? null : { prompt_tokens: tokens - 4, total_tokens: tokens }, max_context_length: tokens === null ? null : 262144 });
+  const p = parse(
+    { role: 'user', uuid: 'u-1', finished: true, content: null, details: details(null) },
+    { role: 'assistant', uuid: 'a-1', content_delta: { content: 'Пар' }, finished: false, details: details(null) },
+    { role: 'assistant', uuid: 'a-1', content: { content: 'Париж' }, finished: true, details: details(8599) },
+  );
+  assert.deepEqual(p.result().usage, { tokens: 8599, limit: 262144 });
+});
+
+test('без details заполненность неизвестна; второй ответ в потоке — его usage', () => {
+  assert.equal(parse({ role: 'assistant', uuid: 'a-1', content: { content: 'ок' }, finished: true }).result().usage, undefined);
+  const p = parse(
+    { role: 'assistant', uuid: 'a-1', content: { content: 'x' }, finished: true, details: { usage: { total_tokens: 100 }, max_context_length: 1000 } },
+    { role: 'assistant', uuid: 'a-2', content: { content: 'y' }, finished: true, details: { usage: { total_tokens: 200 }, max_context_length: 1000 } },
+  );
+  assert.deepEqual(p.result().usage, { tokens: 200, limit: 1000 });
+});

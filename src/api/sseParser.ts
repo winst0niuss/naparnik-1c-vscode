@@ -14,6 +14,15 @@ export interface SseParseResult {
   hasOnlyReasoning: boolean;
   toolCalls: ToolCall[];
   assistantUuid?: string;
+  /** Заполненность контекста дискуссии после этого ответа — из details.usage финального события */
+  usage?: ContextUsage;
+}
+
+export interface ContextUsage {
+  /** Токенов в контексте ветки: вопрос со всей историей + ответ */
+  tokens: number;
+  /** Предел контекста модели (max_context_length) */
+  limit: number;
 }
 
 // Любой JSON-объект из SSE: без строгой схемы, поля бывают null
@@ -28,6 +37,7 @@ export class SseParser {
   private hasToolCalls = false;
   private toolCalls: ToolCall[] | undefined;
   private assistantUuid: string | undefined;
+  private usage: ContextUsage | undefined;
   // Ответ ассистента завершён (finished), но поток может продолжиться следующим ответом
   private messageFinished = false;
 
@@ -70,6 +80,12 @@ export class SseParser {
 
     if (data.finished) {
       this.messageFinished = true;
+      // При переполнении сервер не возвращает ошибку, а молча выбрасывает начало разговора — следим за объёмом сами
+      const details = isObject(data.details) ? data.details : undefined;
+      const tokens = isObject(details?.usage) ? details.usage.total_tokens : undefined;
+      if (typeof tokens === 'number' && typeof details?.max_context_length === 'number') {
+        this.usage = { tokens, limit: details.max_context_length };
+      }
     }
   }
 
@@ -95,6 +111,7 @@ export class SseParser {
     this.hasToolCalls = false;
     this.toolCalls = undefined;
     this.assistantUuid = undefined;
+    this.usage = undefined;
     this.messageFinished = false;
   }
 
@@ -111,6 +128,7 @@ export class SseParser {
       hasOnlyReasoning: this.hasReasoning && !text,
       toolCalls: this.toolCalls ?? [],
       assistantUuid: this.assistantUuid,
+      usage: this.usage,
     };
   }
 }

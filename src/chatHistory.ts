@@ -2,10 +2,10 @@
 import type * as vscode from 'vscode';
 
 export interface ChatEntry {
-  // step — шаг работы с проектом («Читаю …»)
-  role: 'user' | 'assistant' | 'error' | 'step';
+  // step — шаг работы с проектом («Читаю …»); compact — пересказ, которым заменили историю (/compact)
+  role: 'user' | 'assistant' | 'error' | 'step' | 'compact';
   text: string;
-  /** Для сообщения пользователя: какой файл редактора был приложен («chatHistory.ts · строки 10–24») */
+  /** Для сообщения пользователя: какой файл редактора был приложен («chatHistory.ts · строки 10–24»); для пересказа — как сжат */
   context?: string;
 }
 
@@ -27,6 +27,14 @@ export interface SavedChat {
   agentPrimed?: boolean;
   /** Доступ к проекту выключили после инструкции — модели уже сказано не использовать команды */
   agentPaused?: boolean;
+  /** Пересказ после /compact, ещё не отправленный: уйдёт первым сообщением новой дискуссии */
+  compactSummary?: string;
+  /** Заполненность контекста дискуссии после последнего ответа */
+  contextUsage?: { tokens: number; limit: number };
+  /** Подсказка «контекст почти заполнен» уже показана — до следующего сжатия не повторяем */
+  contextHinted?: boolean;
+  /** Сервис отбросил начало разговора (контекст переполнился) — пересказ в той же дискуссии его уже не помнит */
+  contextTruncated?: boolean;
 }
 
 const STORAGE_KEY = 'naparnik.chats';

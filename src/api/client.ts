@@ -2,7 +2,7 @@
  * HTTP-клиент к API 1С:Напарник (code.1c.ai).
  * Порт OneCApiClient из 1c-ai-mcp, адаптированный под чат: ответ стримится в UI.
  */
-import { SseParser, SseParseResult, ToolCall, stripThinkingTags } from './sseParser';
+import { ContextUsage, SseParser, SseParseResult, ToolCall, stripThinkingTags } from './sseParser';
 
 export interface ClientConfig {
   token: string;
@@ -51,6 +51,8 @@ export interface ChatAnswer {
   text: string;
   /** UUID ответа ассистента — передаётся как parentUuid следующего сообщения, чтобы модель помнила контекст */
   assistantUuid?: string;
+  /** Заполненность контекста после ответа — для индикатора и автоматического сжатия */
+  usage?: ContextUsage;
 }
 
 // Жёсткий предел на случай, если зацикливание не распознано; обычно хватает 1–8 раундов поиска
@@ -192,7 +194,7 @@ export class NaparnikClient {
         }
         const text = stripThinkingTags(result.text);
         if (text) {
-          return { text, assistantUuid: result.assistantUuid };
+          return { text, assistantUuid: result.assistantUuid, ...(result.usage && { usage: result.usage }) };
         }
         // Сервер изредка присылает пустой ответ (наблюдалось после отклонённых инструментов 1С:EDT).
         // Просим продолжить, а не роняем весь запрос

@@ -461,3 +461,61 @@ button.toggle.on .toggle-dot {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Заполненность контекста: «Контекст 45%», клик — /compact */
+button.context-usage {
+  margin-left: auto;
+  align-self: center;
+  padding: 0 4px;
+  font-size: 11px;
+  color: var(--vscode-foreground);
+  background: transparent;
+  border: none;
+  opacity: 0.65;
+  white-space: nowrap;
+}
+
+button.context-usage:hover {
+  opacity: 1;
+  text-decoration: underline;
+}
+
+button.context-usage.warn {
+  color: var(--vscode-editorWarning-foreground, #cca700);
+  opacity: 1;
+}
+
+/* Отметка «Контекст сжат»: пересказ свёрнут, клик — развернуть */
+.message.compact {
+  font-size: 12px;
+  border-top: 1px dashed var(--vscode-panel-border);
+  border-bottom: 1px dashed var(--vscode-panel-border);
+  border-radius: 0;
+  padding: 4px 6px;
+}
+
+.compact-header {
+  display: flex;
+  gap: 6px;
+  cursor: pointer;
+  opacity: 0.8;
+}
+
+.compact-header:hover {
+  opacity: 1;
+}
+
+.compact-body {
+  display: none;
+  margin-top: 6px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.message.compact.expanded .compact-body {
+  display: block;
+}
+
+.message.compact.expanded .steps-arrow {
+  transform: rotate(90deg);
+}

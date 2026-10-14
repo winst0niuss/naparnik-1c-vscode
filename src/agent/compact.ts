@@ -125,7 +125,7 @@ export function buildTranscript(entries: ChatEntry[], maxChars = MAX_TRANSCRIPT_
     }
     flushSteps();
     if (e.role === 'user') blocks.push(`### Я${e.context ? ` (приложено: ${e.context})` : ''}\n${e.text}`);
-    else if (e.role === 'assistant') blocks.push(`### Ты\n${e.text}`);
+    else if (e.role === 'assistant') blocks.push(`### Ты${e.interrupted ? ' (ответ прерван)' : ''}\n${e.text}`);
     else if (e.role === 'compact') blocks.push(`### Пересказ более ранней части разговора\n${e.text}`);
     else blocks.push(`[Ошибка: ${e.text}]`);
   }

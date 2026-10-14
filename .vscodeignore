@@ -11,3 +11,5 @@ CLAUDE.md
 .claude/**
 .playwright-mcp/**
 COMPACT-RESULTS.md
+out/test-live/**
+test-results/**

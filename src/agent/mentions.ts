@@ -3,6 +3,7 @@
  * «@src/cf/Catalogs/Клиенты/» или просто «@README.md», если файл с таким именем в проекте один.
  * Папки в списке путей — с «/» на конце. Без зависимости от vscode.
  */
+import { createHash } from 'node:crypto';
 
 export const MAX_MENTION_FILE_CHARS = 60_000;
 // Одно сообщение модель дочитывает до ~300 тыс. символов, контекст общий на весь чат — берём половину
@@ -136,14 +137,19 @@ export function rankPaths(query: string, paths: string[], limit = 30): string[] 
 
 /**
  * Блок с содержимым упомянутых файлов для модели. Не поместившееся в лимит — в skipped,
- * notRead — файлы папок, которые не приложены (не поместились или не читались)
+ * notRead — файлы папок, которые не приложены (не поместились или не читались).
+ * known — хеши файлов, уже отправленных в этом чате: неизменённые идут только в перечне, без содержимого.
+ * hashes — хеши всех приложенных сейчас (для следующего вопроса)
  */
 export function formatMentionedFiles(
   files: { path: string; text: string; label?: string }[],
   notRead: string[] = [],
-): { text: string; skipped: string[] } {
+  known: Record<string, string> = {},
+): { text: string; skipped: string[]; hashes: Record<string, string> } {
   const parts: string[] = [];
   const attached: string[] = [];
+  const unchanged: string[] = [];
+  const hashes: Record<string, string> = {};
   let skipped: string[] = [];
   let total = 0;
   for (const f of files) {
@@ -158,21 +164,30 @@ export function formatMentionedFiles(
     const ext = f.path.match(/\.(\w+)$/)?.[1].toLowerCase() ?? '';
     const lang = ext === 'os' ? 'bsl' : ext;
     attached.push(name);
-    parts.push(`--- ${name}${note} ---\n\`\`\`${lang}\n${shown}\n\`\`\``);
+    const hash = createHash('sha1').update(`${note}\0${shown}`).digest('hex');
+    hashes[name] = hash;
+    // Тот же текст уже в чате — повторно не шлём (большая папка — это 150 тыс. символов на каждый вопрос)
+    if (known[name] === hash) unchanged.push(name);
+    else parts.push(`--- ${name}${known[name] ? ' (изменён после прошлого сообщения)' : ''}${note} ---\n\`\`\`${lang}\n${shown}\n\`\`\``);
   }
   skipped = skipped.concat(notRead); // не push(...): список папки бывает огромным
+  const sameNote = unchanged.length
+    ? ` Не изменились с прошлых сообщений (${unchanged.length}), их содержимое — выше в чате: ${shortList(unchanged, MAX_SKIPPED_LISTED)}.`
+    : '';
   const text =
-    parts.length === 0
+    attached.length === 0
       ? ''
       : // Перечень в начале: после длинных файлов модель теряла последний (живой API, 5 файлов — 4 в 5 прогонах из 6)
-        `[Файлы, приложенные пользователем к вопросу (${attached.length}): ${shortList(attached, MAX_SKIPPED_LISTED)}. ` +
-        `Содержимое каждого — ниже, повторно их не читай]\n${parts.join('\n\n')}` +
+        `[Файлы, приложенные пользователем к вопросу (${attached.length}): ${shortList(attached, MAX_SKIPPED_LISTED)}.` +
+        (parts.length ? ` Содержимое ${unchanged.length ? 'новых и изменённых' : 'каждого'} — ниже, повторно их не читай.` : '') +
+        `${sameNote}]` +
+        (parts.length ? `\n${parts.join('\n\n')}` : '') +
         // Число и «содержимого нет» — без них на большой папке модель путала, сколько файлов видит (живой API: 2 из 6 верно)
         (skipped.length
           ? `\n\n[Не приложены из-за объёма — ещё ${skipped.length} файл(ов), их содержимого в сообщении нет. ` +
             `Приложено с содержимым — ${attached.length}. Не приложенные: ${shortList(skipped, MAX_SKIPPED_LISTED)}]`
           : '');
-  return { text, skipped };
+  return { text, skipped, hashes };
 }
 
 /**

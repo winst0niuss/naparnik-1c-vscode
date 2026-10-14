@@ -6,7 +6,7 @@ import { TokenStore } from './tokenStore';
 import { ChatEntry, ChatHistory, SavedChat, createChat, makeTitle } from './chatHistory';
 import { AgentCommand, MAX_AGENT_STEPS, buildAgentPrompt, findUnfinishedWrite, stripCommandsForDisplay } from './agent/protocol';
 import { runAgentLoop } from './agent/agentLoop';
-import { INIT_PROMPT, MAKE_RULES_PROMPT, RULES_DIR, SLASH_COMMANDS, helpText, parseSlash } from './slashCommands';
+import { MAKE_RULES_PROMPT, initPrompt, RULES_DIR, SLASH_COMMANDS, helpText, parseSlash } from './slashCommands';
 import { WorkspaceTools, findGitRepository } from './agent/workspaceTools';
 import { EditPreview, PendingEdit } from './agent/editPreview';
 import { EditorContextTracker } from './editorContextTracker';
@@ -57,10 +57,18 @@ import {
   userMessages,
 } from './agent/compact';
 
-/** /init выполнен, только если NAPARNIK.md создан или изменён */
-function initDone(executed: AgentCommand[]): string | undefined {
-  const written = executed.some((c) => (c.kind === 'create_file' || c.kind === 'edit_file') && /(^|\/)NAPARNIK\.md$/i.test(c.path));
-  return written ? undefined : 'Задача не выполнена: NAPARNIK.md ещё не создан. Если информации достаточно — создай его командой @create_file NAPARNIK.md … @end; если нет — дочитай нужное командами.';
+/** /init выполнен, только если NAPARNIK.md создан или изменён (правка применена, а не отклонена) */
+function initDone(exists: boolean) {
+  return (executed: AgentCommand[]): string | undefined => {
+    const written = executed.some((c) => (c.kind === 'create_file' || c.kind === 'edit_file') && /(^|\/)NAPARNIK\.md$/i.test(c.path));
+    if (written) return undefined;
+    return exists
+      ? // Живой API: модель звала серверный Edit, сервер его не знает — и она сдавалась («инструмент Edit не работает»)
+        'Задача не выполнена: NAPARNIK.md не изменён. Инструменты Edit и Write здесь не работают — правь только текстовым блоком в ответе:\n' +
+          '@edit_file NAPARNIK.md\n<<<<<<< SEARCH\nстроки из текущего NAPARNIK.md дословно\n=======\nновые строки\n>>>>>>> REPLACE\n@end\n' +
+          'Если текущего текста не видел — сначала @read_file NAPARNIK.md.'
+      : 'Задача не выполнена: NAPARNIK.md ещё не создан. Если информации достаточно — создай его командой @create_file NAPARNIK.md … @end; если нет — дочитай нужное командами.';
+  };
 }
 
 const PROJECT_ACCESS_KEY = 'naparnik.projectAccess';
@@ -110,6 +118,8 @@ interface GatheredContext {
   overflowFolders: string[];
   /** Объём каждого файла, фрагмента и папки — для чипов и сводки в чате */
   chipStats: Record<string, AttachmentStat>;
+  /** Блок для модели без файлов, уже отправленных в чате неизменёнными (known — хеши из SavedChat.sentFiles) */
+  format: (known?: Record<string, string>) => { text: string; hashes: Record<string, string> };
 }
 
 /** Запрос, который выполняется в фоне — у каждого чата свой */
@@ -178,7 +188,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')],
     };
     view.webview.html = this.renderHtml(view.webview);
-    view.webview.onDidReceiveMessage((msg: WebviewMessage) => this.handleMessage(msg));
+    // Ошибка в обработчике не должна оставить панель в состоянии «отвечает» без объяснения
+    view.webview.onDidReceiveMessage((msg: WebviewMessage) =>
+      this.handleMessage(msg).catch((err) => this.post({ type: 'error', message: `Ошибка расширения: ${errorMessage(err)}` })),
+    );
     view.onDidDispose(() => (this.view = undefined));
   }
 
@@ -515,8 +528,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'init':
         if (await this.ensureProjectAccess('/init')) {
+          const tools = WorkspaceTools.forCurrentWorkspace(this.preview.confirm);
+          const exists = (await tools?.readFileText('NAPARNIK.md').then(() => true, () => false)) ?? false;
           // Изучение проекта требует больше шагов, чем обычный вопрос
-          await this.send('/init', INIT_PROMPT, false, EXPLORE_MAX_STEPS, initDone);
+          await this.send('/init', initPrompt(exists), false, EXPLORE_MAX_STEPS, initDone(exists), 'NAPARNIK.md не создан и не изменён — повторите /init.');
         }
         break;
       case 'make-rules':
@@ -800,7 +815,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (chat.conversationId && chat.lastAssistantUuid && !chat.contextTruncated) {
         summary = await client
           .sendMessage(chat.conversationId, compactPrompt(instructions, userMessages(chat.entries)), chat.lastAssistantUuid, callbacks, signal)
-          .then((a) => a.text)
+          // Зациклилась на инструментах — пересказа нет, как и при ошибке
+          .then((a) => (a.stalled ? '' : a.text))
           .catch((err) => {
             if (signal.aborted) throw err;
             return '';
@@ -810,7 +826,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         fromTranscript = true;
         callbacks.onText('');
         const conversationId = await client.createConversation(signal);
-        summary = (await client.sendMessage(conversationId, compactTranscriptPrompt(buildTranscript(chat.entries), instructions), undefined, callbacks, signal)).text;
+        const answer = await client.sendMessage(conversationId, compactTranscriptPrompt(buildTranscript(chat.entries), instructions), undefined, callbacks, signal);
+        summary = answer.stalled ? '' : answer.text;
       }
       if (!isUsableSummary(summary)) throw new Error('Напарник не составил пересказ — контекст не сжат.');
 
@@ -821,7 +838,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         agentPrimed: false,
         agentPaused: false,
         lastEditorContext: undefined,
-        lastAttachments: undefined,
+        sentFiles: undefined,
         compactSummary: summary,
         contextUsage: undefined,
         contextHinted: false,
@@ -855,6 +872,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     withEditorContext: boolean | 'force' = false,
     maxSteps = MAX_AGENT_STEPS,
     checkDone?: (executed: AgentCommand[], answerText: string) => string | undefined,
+    notDoneNote?: string,
   ): Promise<boolean> {
     text = text.trim();
     // В одном чате — один запрос за раз; в других чатах можно спрашивать параллельно
@@ -882,6 +900,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const editorSnap = useEditor ? this.editorContext.snapshot() : undefined;
     const editorPath = editorSnap && this.editorRelativePath();
     const mentioned = modelText === undefined ? await this.resolveMentions(text, attached) : undefined;
+    // Неизменённые файлы, уже отправленные в этой дискуссии, идут только перечнем — в прогноз объёма тоже не входят
+    let files = mentioned?.format(chat.sentFiles);
     // Открытый файл уже приложен целиком (чипом, папкой или @-упоминанием) — второй раз его текст не шлём,
     // только отсылку. Не поместился в лимит — текст остаётся в контексте редактора, иначе файл не дошёл бы вовсе
     const editorTextAttached = Boolean(editorSnap && !editorSnap.selection && editorPath && mentioned?.shownFiles.has(editorPath));
@@ -890,11 +910,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const context = [editorLabel, mentioned?.label].filter(Boolean).join(' · ') || undefined;
 
     // Вопрос не поместится в контекст — сервер молча выбросил бы начало чата. Сжимаем заранее
-    const messageChars = (modelText ?? text).length + (mentioned?.block.length ?? 0) + (editorSnap ? formatEditorContext(editorSnap, editorTextAttached).length : 0);
+    const messageChars = (modelText ?? text).length + (files?.text.length ?? 0) + (editorSnap ? formatEditorContext(editorSnap, editorTextAttached).length : 0);
     if (readSettings().autoCompact && !chat.compactSummary && needsAutoCompact(chat.contextUsage, messageChars)) {
       // Остановили сжатие — не отправляем; не вышло — отправляем как есть
       if ((await this.compact(chat, '', true)) === 'aborted') return false;
       if (this.running.has(chat.id)) return false;
+      // После сжатия дискуссия новая — файлы уходят целиком
+      files = mentioned?.format(chat.sentFiles);
     }
     // Состояние дискуссии до запроса: после ошибки или «Стоп» продолжаем от последнего полного ответа
     const before = {
@@ -902,7 +924,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       agentPrimed: chat.agentPrimed,
       agentPaused: chat.agentPaused,
       lastEditorContext: chat.lastEditorContext,
-      lastAttachments: chat.lastAttachments,
+      sentFiles: chat.sentFiles,
       compactSummary: chat.compactSummary,
       contextUsage: chat.contextUsage,
     };
@@ -912,8 +934,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     chat.entries.push({ role: 'user', text, context });
     const run: RunningRequest = { chat, abort: new AbortController(), partial: '' };
     this.running.set(chat.id, run);
-    // Сохраняем сразу, чтобы чат появился в истории, пока идёт ответ
-    await this.history.save(chat);
 
     // Сообщения в webview — только если этот чат сейчас на экране
     const postIfVisible = (message: object) => {
@@ -925,11 +945,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     postIfVisible({ type: 'assistantStart' });
 
     try {
+      // Сохраняем сразу, чтобы чат появился в истории, пока идёт ответ. Внутри try: при ошибке записи
+      // finally снимет признак «отвечает», иначе чат остался бы занят до перезапуска
+      await this.history.save(chat);
       const client = new NaparnikClient({ token, ...readSettings() });
       chat.conversationId ??= await client.createConversation(run.abort.signal);
 
       // О каких git-действиях просили: вопрос пользователя и предыдущий ответ Напарника («закоммитить?» → «да»)
-      const previousAnswer = chat.entries.slice(0, -1).reverse().find((e) => e.role === 'assistant')?.text ?? '';
+      const previousAnswer = chat.entries.slice(0, -1).reverse().find((e) => e.role === 'assistant' && !e.interrupted)?.text ?? '';
       const tools = this.projectAccess
         ? WorkspaceTools.forCurrentWorkspace(
             this.preview.confirm,
@@ -950,14 +973,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       } else if (editorHash) {
         chat.lastEditorContext = editorHash;
       }
-      // Чипы остаются между вопросами — те же неизменённые файлы повторно не шлём, только перечень выбранного
-      let filesBlock = mentioned?.block ?? '';
-      const filesHash = filesBlock ? createHash('sha1').update(filesBlock).digest('hex') : undefined;
-      if (filesHash && filesHash === chat.lastAttachments) {
-        filesBlock = '[Приложенные файлы не изменились с прошлого сообщения — их содержимое выше в чате]';
-      } else if (filesHash) {
-        chat.lastAttachments = filesHash;
-      }
+      // Чипы остаются между вопросами — неизменённые файлы повторно не шлём, только перечень; изменённый — целиком
+      const filesBlock = files?.text ?? '';
+      if (files) chat.sentFiles = { ...chat.sentFiles, ...files.hashes };
       // Папка не поместилась — модель может дочитать её сама: с доступом к проекту — любыми командами,
       // без доступа — только чтение внутри этих папок
       const overflow = mentioned?.overflowFolders ?? [];
@@ -991,6 +1009,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         tools: tools ?? folderTools,
         maxSteps,
         checkDone,
+        notDoneNote,
         signal: run.abort.signal,
         onText: (partial) => {
           run.partial = chat.agentPrimed || folderTools ? stripCommandsForDisplay(partial) : partial;
@@ -1030,6 +1049,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // Ветка дискуссии только растёт; стала меньше — сервис молча отбросил начало разговора (живой API)
       if (answer.usage && before.contextUsage && answer.usage.tokens < before.contextUsage.tokens && !chat.contextTruncated) {
         chat.contextTruncated = true;
+        // Начало разговора выброшено — отправленные раньше файлы модель могла забыть, следующий вопрос пришлёт их снова
+        chat.sentFiles = undefined;
+        chat.lastEditorContext = undefined;
         postIfVisible({
           type: 'info',
           text: '⚠️ Контекст чата переполнился, и сервис отбросил начало разговора — Напарник его больше не помнит. Сожмите контекст — `/compact`: пересказ составится по записи всего чата.',
@@ -1046,6 +1068,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return true;
     } catch (err) {
       const message = run.abort.signal.aborted ? 'Остановлено' : errorMessage(err);
+      // Уже показанная часть ответа остаётся в истории — пользователь её видел и может к ней вернуться
+      if (run.partial.trim()) chat.entries.push({ role: 'assistant', text: run.partial.trim(), interrupted: true });
       chat.entries.push({ role: 'error', text: message });
       postIfVisible({ type: 'error', message });
       // Дискуссию не сбрасываем: следующий вопрос уйдёт от последнего полного ответа, и модель помнит чат
@@ -1054,7 +1078,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       Object.assign(chat, before);
       // Сервер отверг запрос к дискуссии (не токен и не лимит частоты) — она могла испортиться, начинаем новую
       if (err instanceof ApiError && err.status >= 400 && err.status < 500 && ![401, 403, 429].includes(err.status)) {
-        Object.assign(chat, { conversationId: undefined, lastAssistantUuid: undefined, agentPrimed: false, agentPaused: false, lastEditorContext: undefined, lastAttachments: undefined, contextUsage: undefined, contextTruncated: false });
+        Object.assign(chat, { conversationId: undefined, lastAssistantUuid: undefined, agentPrimed: false, agentPaused: false, lastEditorContext: undefined, sentFiles: undefined, contextUsage: undefined, contextTruncated: false });
       }
       return false;
     } finally {
@@ -1083,7 +1107,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async resolveMentions(
     text: string,
     attached: string[] = [],
-  ): Promise<{ block: string; selection: string; label: string; overflowFolders: string[]; notes: string[]; shownFiles: Set<string> } | undefined> {
+  ): Promise<
+    | { block: string; selection: string; label: string; overflowFolders: string[]; notes: string[]; shownFiles: Set<string>; format: GatheredContext['format'] }
+    | undefined
+  > {
     const ctx = await this.gatherContext(text, attached);
     if (!ctx) return undefined;
     const isShown = (key: string) => ctx.shownChars.has(attachmentLabel(key));
@@ -1097,10 +1124,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const f = parseFragment(unique[i]);
       return f ? `✂️ ${name}:${f.from}–${f.to}` : unique[i].endsWith('/') ? `📁 ${name}` : `📄 ${name}`;
     });
-    if (!ctx.block) return { block: '', selection: '', label: '', overflowFolders: [], notes: ctx.notes, shownFiles: new Set() };
+    if (!ctx.block) return { block: '', selection: '', label: '', overflowFolders: [], notes: ctx.notes, shownFiles: new Set(), format: () => ({ text: '', hashes: {} }) };
     // Ключи приложенного: файл целиком — его путь, фрагмент — «путь (строки …)»
     const shownFiles = new Set(ctx.shownChars.keys());
-    return { block: ctx.block, selection: formatSelection(unique), label: names.join(', '), overflowFolders: ctx.overflowFolders, notes: ctx.notes, shownFiles };
+    return { block: ctx.block, selection: formatSelection(unique), label: names.join(', '), overflowFolders: ctx.overflowFolders, notes: ctx.notes, shownFiles, format: ctx.format };
   }
 
   /** Читает упомянутое и приложенное и раскладывает по лимитам — как уйдёт модели */
@@ -1215,7 +1242,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         notes.push(`${f ? '✂️' : '📄'} ${name}: не поместился в лимит, не приложен.`);
       }
     }
-    return { block, notes, shownChars, fileMentions, folderMentions, folderContents, folderBinary, overflowFolders, chipStats };
+    const format = (known?: Record<string, string>) => {
+      const { text, hashes } = formatMentionedFiles(files, notRead, known);
+      return { text, hashes };
+    };
+    return { block, notes, shownChars, fileMentions, folderMentions, folderContents, folderBinary, overflowFolders, chipStats, format };
   }
 
   /** Ответ пришёл в чат, который пользователь сейчас не видит, — сообщаем */

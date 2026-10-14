@@ -4,6 +4,7 @@
  * Чтение (статус, diff, журнал, ветки) — без вопросов; то, что меняет репозиторий, — после подтверждения пользователя.
  * Опасных операций (reset, rebase, push --force, удаление веток, настройки) нет вовсе.
  */
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { GitCommand } from './protocol';
 
@@ -89,6 +90,20 @@ export type ConfirmGit = (operation: GitOperation, signal?: AbortSignal, owner?:
 
 // Результат для модели: большой diff обрезаем, как и чтение файла
 export const MAX_DIFF_CHARS = 60_000;
+
+/** Текст нового файла для diff; каталог, симлинк, двоичный или слишком большой файл — undefined (только в списке) */
+async function readNewFile(file: string, maxChars: number): Promise<string | undefined> {
+  try {
+    const st = await fs.lstat(file);
+    // Симлинк может вести за пределы проекта — его не читаем
+    if (!st.isFile() || st.size > maxChars) return undefined;
+    const text = (await fs.readFile(file, 'utf8')).replace(/^\uFEFF/, '');
+    return text.includes('\0') ? undefined : text;
+  } catch {
+    return undefined;
+  }
+}
+
 const DEFAULT_LOG = 10;
 const MAX_LOG = 50;
 const MAX_BRANCHES = 50;
@@ -252,9 +267,25 @@ export class GitTools {
     const parts: string[] = [];
     if (staged.trim()) parts.push(`Подготовлено к коммиту (staged):\n${staged.trimEnd()}`);
     if (unstaged.trim()) parts.push(`Не подготовлено:\n${unstaged.trimEnd()}`);
-    if (newFiles.length > 0) {
-      parts.push(`Новые файлы (не отслеживаются, содержимое — через @read_file):\n${newFiles.map((p) => this.relative(p)).join('\n')}`);
+    // Содержимое новых файлов — сразу в diff: со ссылкой «через @read_file» модель звала @git_diff того же файла
+    // по кругу, пока не кончались шаги (живой API: ревью нового файла 0/2)
+    // Читаем, пока не кончился бюджет diff: новых файлов могут быть сотни, лишнее всё равно обрежется
+    let budget = MAX_DIFF_CHARS - parts.join('\n\n').length;
+    const listed: string[] = [];
+    const contents: string[] = [];
+    for (const p of newFiles) {
+      const text = budget > 0 ? await readNewFile(p, budget) : undefined;
+      if (text === undefined) {
+        listed.push(this.relative(p));
+        continue;
+      }
+      const part = `Новый файл ${this.relative(p)} (не отслеживается):\n${text.trimEnd()}`;
+      contents.push(part);
+      budget -= part.length;
     }
+    // Список — перед содержимым: обрезка по MAX_DIFF_CHARS не должна его отрезать
+    if (listed.length > 0) parts.push(`Новые файлы (не отслеживаются, содержимое — через @read_file):\n${listed.join('\n')}`);
+    parts.push(...contents);
     if (parts.length === 0) return target ? `Изменений в ${this.relative(target)} нет.` : 'Незакоммиченных изменений нет.';
     const text = parts.join('\n\n');
     return text.length > MAX_DIFF_CHARS

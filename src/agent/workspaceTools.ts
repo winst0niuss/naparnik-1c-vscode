@@ -69,6 +69,9 @@ export class WorkspaceTools {
   }
 
   private gitTools?: Promise<GitTools | undefined>;
+  // Файлы, правку которых пользователь отклонил в этом запросе (WorkspaceTools создаётся на запрос).
+  // Живой API: после отказа модель предлагала правку того же файла ещё 2 раза подряд
+  private readonly rejectedEdits = new Set<string>();
 
   /** Команды git для репозитория проекта; undefined — проект не в git или расширение Git выключено */
   git(): Promise<GitTools | undefined> {
@@ -184,6 +187,9 @@ export class WorkspaceTools {
       const dir = queue.shift()!;
       for (const [name, type] of await this.sortedEntries(dir)) {
         const uri = vscode.Uri.joinPath(dir, name);
+        // Символические ссылки обходим только на файлы внутри проекта: ссылка на папку может вести
+        // наружу (поиск читал бы и отправлял чужие файлы) или по кругу
+        if (type & vscode.FileType.SymbolicLink && ((type & vscode.FileType.Directory) || !(await this.linksInside(uri)))) continue;
         if (type & vscode.FileType.Directory) queue.push(uri);
         else if (!match || match.test(this.relative(uri))) files.push(uri);
         if (files.length >= limit) break;
@@ -336,9 +342,14 @@ export class WorkspaceTools {
 
   private async editFile(relPath: string, edits: { search: string; replace: string }[]): Promise<string> {
     const uri = await this.resolve(relPath);
+    const key = this.relative(uri);
+    if (this.rejectedEdits.has(key)) {
+      return `Не выполнено: пользователь уже отклонил правку ${relPath} в этом запросе. Не предлагай её снова — ответь текстом, что хотел изменить, и спроси пользователя.`;
+    }
     const original = await this.readText(uri);
     const proposed = applySearchReplace(original, edits);
     if (!(await this.confirmEdit(uri, original, proposed, false, this.signal, this.owner))) {
+      this.rejectedEdits.add(key);
       return `Пользователь отклонил правку ${relPath}.`;
     }
     // Пока пользователь смотрел diff, файл могли изменить — не затираем эти изменения
@@ -457,12 +468,22 @@ export class WorkspaceTools {
     const walk = async (uri: vscode.Uri) => {
       for (const [name, type] of await vscode.workspace.fs.readDirectory(uri)) {
         const child = vscode.Uri.joinPath(uri, name);
-        if (type & vscode.FileType.Directory) await walk(child);
+        // Ссылка на папку переносится как ссылка — внутрь не заходим (она может вести наружу или по кругу)
+        if (type & vscode.FileType.Directory && !(type & vscode.FileType.SymbolicLink)) await walk(child);
         else found.push(this.relative(child));
       }
     };
     await walk(dir);
     return found.sort();
+  }
+
+  /** Символическая ссылка ведёт внутрь проекта */
+  private async linksInside(uri: vscode.Uri): Promise<boolean> {
+    try {
+      return isInside(await realpath(this.root.fsPath), await realpath(uri.fsPath));
+    } catch {
+      return false;
+    }
   }
 
   private async isDirectory(uri: vscode.Uri): Promise<boolean> {

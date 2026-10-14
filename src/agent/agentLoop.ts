@@ -60,9 +60,15 @@ export interface AgentLoopOptions {
   /**
    * Проверка, что задача выполнена (например, /init создал NAPARNIK.md).
    * Возвращает подсказку модели, если не выполнена, — тогда цикл продолжается (до двух раз).
+   * executed — выполненные команды; правки и создание файлов — только применённые (отклонённые и упавшие не считаются).
    * answerText — ответ модели без команд (по нему видно, отказалась ли модель или решила, что делать нечего).
    */
   checkDone?: (executed: AgentCommand[], answerText: string) => string | undefined;
+  /**
+   * Задача так и не выполнена (checkDone не прошёл и напоминания кончились) — эта строка добавляется к ответу.
+   * Живой API: /init при существующем NAPARNIK.md отвечал «файл создан», хотя ничего не записал
+   */
+  notDoneNote?: string;
 }
 
 export interface AgentLoopResult extends ChatAnswer {
@@ -110,6 +116,10 @@ function isApplied(result: string): boolean {
   return /^Правка .+ применена\.$|^Файл .+ создан\.$/.test(result.trim());
 }
 
+function isFileWrite(cmd: AgentCommand): boolean {
+  return cmd.kind === 'edit_file' || cmd.kind === 'create_file';
+}
+
 export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult> {
   const { client, conversationId, tools, maxSteps, signal } = opts;
   let parentUuid = opts.parentUuid;
@@ -140,8 +150,9 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
               const description =
                 tools.readOnly && !READ_COMMANDS.has(cmd.kind) ? `⛔ Недоступно без доступа к проекту: ${describeCommand(cmd)}` : describeCommand(cmd);
               opts.onStep?.(description);
-              executed.push(cmd);
-              return `${call.function?.name} здесь не работает — расширение выполнило его как @${cmd.kind}. Дальше используй @-команды.\n\n${await tools.run(cmd)}`;
+              const result = await tools.run(cmd);
+              if (!isFileWrite(cmd) || isApplied(result)) executed.push(cmd);
+              return `${call.function?.name} здесь не работает — расширение выполнило его как @${cmd.kind}. Дальше используй @-команды.\n\n${result}`;
             }
           : undefined,
       },
@@ -174,7 +185,9 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       // Ответ без команд, но задача явно не доделана — до двух напоминаний, если шаги ещё есть
       const notDone = !tools
         ? undefined
-        : unsupportedGit && !tools.readOnly
+        : answer.stalled
+          ? (opts.checkDone?.(executed, '') ?? (tools.readOnly ? READ_ONLY_CONTINUE_HINT : AGENT_CONTINUE_HINT))
+          : unsupportedGit && !tools.readOnly
           ? GIT_UNSUPPORTED_HINT
           : looksLikeTextToolCall(answer.text)
           ? tools.readOnly
@@ -187,6 +200,9 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         opts.onNextRound?.();
         message = notDone;
         continue;
+      }
+      if (opts.notDoneNote && opts.checkDone?.(executed, answer.text)) {
+        return { ...answer, text: `${answer.text}\n\n⚠️ ${opts.notDoneNote}`, steps: step, finishedByLimit: finishing };
       }
       return { ...answer, steps: step, finishedByLimit: finishing };
     }
@@ -223,7 +239,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       opts.onStep?.(description);
       const result = await tools!.run(cmd);
       results.push(`### ${description}\n${result}`);
-      executed.push(cmd);
+      if (!isFileWrite(cmd) || isApplied(result)) executed.push(cmd);
       // Пока пользователь смотрел diff, запрос могли остановить
       if (signal.aborted) throw new Error('Остановлено');
       if ((cmd.kind === 'edit_file' || cmd.kind === 'create_file') && isBslPath(cmd.path) && isApplied(result)) {

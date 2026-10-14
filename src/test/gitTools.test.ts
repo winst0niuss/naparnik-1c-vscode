@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
 import * as path from 'node:path';
-import { ConfirmGit, GitChange, GitOperation, GitRepository, GitTools, isValidBranchName, requestedByUser } from '../agent/gitTools';
+import { ConfirmGit, GitChange, GitOperation, GitRepository, GitTools, MAX_DIFF_CHARS, isValidBranchName, requestedByUser } from '../agent/gitTools';
 
 const ROOT = path.resolve('/proj');
 const abs = (rel: string) => path.join(ROOT, rel);
@@ -65,6 +67,30 @@ test('git diff: staged и не подготовленное раздельно, 
   assert.match(text, /Подготовлено к коммиту \(staged\):\ndiff --git a\/staged\.bsl/);
   assert.match(text, /Не подготовлено:\ndiff --git a\/work\.bsl/);
   assert.match(text, /Новые файлы.*:\ndir\/new\.bsl/);
+});
+
+test('git diff: текст нового файла — сразу в diff, двоичный и симлинк — списком', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'naparnik-git-'));
+  try {
+    await fs.writeFile(path.join(dir, 'new.ts'), '\uFEFFexport const x = 42;\n');
+    await fs.writeFile(path.join(dir, 'bin.dat'), Buffer.from([0, 1, 2]));
+    await fs.symlink(path.join(dir, 'new.ts'), path.join(dir, 'link.ts'));
+    const untracked = ['new.ts', 'bin.dat', 'link.ts'].map((rel) => ({ uri: { fsPath: path.join(dir, rel) }, status: 7 }));
+    const { repo, state } = mockRepo({ workingTreeChanges: untracked });
+    const git = new GitTools({ ...repo, rootUri: { fsPath: dir }, diff: async () => '', diffWithHEAD: async () => '' }, dir, async () => true);
+    const text = await git.run({ kind: 'git_diff', path: 'new.ts' });
+    assert.equal(text, 'Новый файл new.ts (не отслеживается):\nexport const x = 42;');
+    const all = await git.run({ kind: 'git_diff' });
+    assert.match(all, /Новые файлы.*:\nbin\.dat\nlink\.ts\n\nНовый файл new\.ts/);
+    // Бюджет diff исчерпан — следующие новые файлы только списком, без чтения
+    await fs.writeFile(path.join(dir, 'big.ts'), 'x'.repeat(MAX_DIFF_CHARS - 10));
+    await fs.writeFile(path.join(dir, 'after.ts'), 'export const y = 1;\n');
+    state.workingTreeChanges = ['big.ts', 'after.ts'].map((rel) => ({ uri: { fsPath: path.join(dir, rel) }, status: 7 }));
+    const over = await git.run({ kind: 'git_diff' });
+    assert.match(over, /Новые файлы.*:\nafter\.ts\n\nНовый файл big\.ts/);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('git diff файла вне проекта — ошибка', async () => {

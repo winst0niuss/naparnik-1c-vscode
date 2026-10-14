@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { AgentClient, FINISH_HINT, looksLikeUnfinishedIntent, runAgentLoop } from '../agent/agentLoop';
-import { AgentCommand, parseCommands } from '../agent/protocol';
+import { AGENT_CONTINUE_HINT, AgentCommand, parseCommands } from '../agent/protocol';
 
 /** Мок модели: отвечает заранее заданными текстами и запоминает, что ей прислали */
 function scriptedClient(replies: string[]) {
@@ -18,7 +18,10 @@ function scriptedClient(replies: string[]) {
 
 function tools() {
   const ran: AgentCommand[] = [];
-  return { ran, tools: { run: async (c: AgentCommand) => (ran.push(c), `ок ${c.kind}`) } };
+  // Результаты записи — как у WorkspaceTools: по ним цикл понимает, что файл действительно записан
+  const result = (c: AgentCommand) =>
+    c.kind === 'create_file' ? `Файл ${c.path} создан.` : c.kind === 'edit_file' ? `Правка ${c.path} применена.` : `ок ${c.kind}`;
+  return { ran, tools: { run: async (c: AgentCommand) => (ran.push(c), result(c)) } };
 }
 
 const base = { conversationId: 'c', parentUuid: undefined, message: 'вопрос', signal: new AbortController().signal, onText: () => {} };
@@ -234,4 +237,31 @@ test('несуществующая git-команда: своя подсказк
   const r = await runAgentLoop({ ...base, client, tools: tools().tools, maxSteps: 12 });
   assert.match(sent[1], /Такой git-команды нет/);
   assert.match(r.text, /^Эту операцию git Напарник не выполняет[\s\S]*```\ngit reset --hard HEAD\n```$/);
+});
+
+test('модель зациклилась на инструментах сервера (stalled): напоминание продолжить, для /init — про NAPARNIK.md', async () => {
+  const sent: string[] = [];
+  const replies = [{ text: 'зациклилась', stalled: true }, { text: '@create_file NAPARNIK.md\n# П\n@end' }, { text: 'Создал файл.' }];
+  const client: AgentClient = {
+    async sendMessage(_conv, message) {
+      sent.push(message);
+      return { ...replies[Math.min(sent.length - 1, replies.length - 1)], assistantUuid: `u${sent.length}` };
+    },
+  };
+  const checkDone = (ex: AgentCommand[]) => (ex.some((c) => c.kind === 'create_file') ? undefined : 'NAPARNIK.md ещё не создан');
+  const r = await runAgentLoop({ ...base, client, tools: tools().tools, maxSteps: 12, checkDone });
+  assert.equal(r.text, 'Создал файл.');
+  assert.equal(sent[1], 'NAPARNIK.md ещё не создан');
+  // Без checkDone — общая просьба продолжить @-командами
+  sent.length = 0;
+  await runAgentLoop({ ...base, client, tools: tools().tools, maxSteps: 12 });
+  assert.equal(sent[1], AGENT_CONTINUE_HINT);
+});
+
+test('checkDone: отклонённая или упавшая запись не считается выполненной; без результата — пометка к ответу', async () => {
+  const { client } = scriptedClient(['@create_file NAPARNIK.md\n# П\n@end', 'Задача выполнена — файл создан.']);
+  const failing = { run: async (c: AgentCommand) => (c.kind === 'create_file' ? 'Ошибка: файл NAPARNIK.md уже существует.' : 'ок') };
+  const checkDone = (ex: AgentCommand[]) => (ex.some((c) => c.kind === 'create_file') ? undefined : 'не создан');
+  const r = await runAgentLoop({ ...base, client, tools: failing, maxSteps: 12, checkDone, notDoneNote: 'NAPARNIK.md не изменён.' });
+  assert.match(r.text, /файл создан\.\n\n⚠️ NAPARNIK\.md не изменён\.$/);
 });

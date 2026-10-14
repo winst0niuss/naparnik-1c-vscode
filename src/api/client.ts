@@ -10,6 +10,8 @@ export interface ClientConfig {
   authFormat: 'plain' | 'bearer';
   skillName: string;
   timeoutMs: number;
+  /** Первая пауза перед повтором при 429/5xx и сбое сети (дальше — вдвое больше); для тестов */
+  retryDelayMs?: number;
 }
 
 export interface StreamCallbacks {
@@ -53,7 +55,11 @@ export interface ChatAnswer {
   assistantUuid?: string;
   /** Заполненность контекста после ответа — для индикатора и автоматического сжатия */
   usage?: ContextUsage;
+  /** Модель зациклилась на инструментах и после просьб продолжить: вызовы не подтверждены, ответа по существу нет */
+  stalled?: boolean;
 }
+
+export const STALLED_TEXT = 'Напарник зациклился на вызовах инструментов и не дал ответа. Попробуйте переформулировать вопрос.';
 
 // Жёсткий предел на случай, если зацикливание не распознано; обычно хватает 1–8 раундов поиска
 const MAX_TOOL_ROUNDS = 25;
@@ -62,6 +68,16 @@ const MAX_TOOL_ROUNDS = 25;
 // Task — 10 отказов подряд. Тогда вместо ответа инструменту пишем от пользователя «продолжай»
 const MAX_IDLE_TOOL_ROUNDS = 3;
 const MAX_CONTINUE_REQUESTS = 2;
+
+// Повторы при временных сбоях: лимит частоты, ошибки шлюза и сервера, обрыв соединения до ответа
+const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
+const MAX_ATTEMPTS = 4;
+const DEFAULT_RETRY_DELAY_MS = 1_000;
+const MAX_RETRY_DELAY_MS = 15_000;
+// Сервер просит ждать дольше — не держим пользователя в тишине, сразу показываем ошибку
+const MAX_RETRY_AFTER_MS = 30_000;
+// Текст в чате перерисовывается целиком — не чаще раза в 50 мс, иначе длинный ответ тормозит панель
+const TEXT_THROTTLE_MS = 50;
 
 // package.json лежит на два уровня выше out/api/ — и в .vsix, и при запуске тестов
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -112,18 +128,23 @@ export class NaparnikClient {
 
   /** Создать дискуссию, вернуть её UUID */
   async createConversation(signal?: AbortSignal): Promise<string> {
-    const response = await fetch(`${this.baseUrl}/chat_api/v1/conversations/`, {
-      method: 'POST',
-      headers: { ...this.headers('*/*'), 'Session-Id': '' },
-      body: JSON.stringify({
-        tool_name: 'custom',
-        skill_name: this.config.skillName,
-        ui_language: 'russian',
-        script_language: 'ru',
-        is_chat: true,
-      }),
-      signal: this.withTimeout(signal),
+    const body = JSON.stringify({
+      tool_name: 'custom',
+      skill_name: this.config.skillName,
+      ui_language: 'russian',
+      script_language: 'ru',
+      is_chat: true,
     });
+    const response = await this.withRetry(
+      () =>
+        fetch(`${this.baseUrl}/chat_api/v1/conversations/`, {
+          method: 'POST',
+          headers: { ...this.headers('*/*'), 'Session-Id': '' },
+          body,
+          signal: this.withTimeout(signal),
+        }),
+      signal,
+    );
 
     if (!response.ok) {
       throw new ApiError(response.status, await safeText(response));
@@ -240,8 +261,13 @@ export class NaparnikClient {
       }
       idleRounds = useful ? 0 : idleRounds + 1;
       // Зациклилась или исчерпала раунды — просим продолжить без инструментов
-      if ((idleRounds >= MAX_IDLE_TOOL_ROUNDS || round >= MAX_TOOL_ROUNDS - 1) && askToContinue(result.assistantUuid)) {
-        continue;
+      if (idleRounds >= MAX_IDLE_TOOL_ROUNDS || round >= MAX_TOOL_ROUNDS - 1) {
+        if (askToContinue(result.assistantUuid)) continue;
+        // Просьбы исчерпаны, а модель всё зовёт то же (живой API, /init: ReadSystemFile несозданного NAPARNIK.md
+        // 20+ раз до лимита раундов, 1 из 9). Дальше не подтверждаем — решает вызывающий: агентный цикл напомнит
+        // продолжить @-командами. Неотвеченные tool_calls сервер принимает как родителя следующего сообщения
+        const text = stripThinkingTags(result.text);
+        return { text: text || STALLED_TEXT, assistantUuid: result.assistantUuid, stalled: true, ...(result.usage && { usage: result.usage }) };
       }
 
       toolsAcked = true;
@@ -269,13 +295,19 @@ export class NaparnikClient {
   ): Promise<SseParseResult> {
     // Таймаут — на паузу в данных, а не на весь ответ: длинный, но идущий ответ не обрываем
     const idle = new IdleTimeout(this.config.timeoutMs);
+    const body = JSON.stringify(payload);
     try {
-      const response = await fetch(`${this.baseUrl}/chat_api/v1/conversations/${conversationId}/messages`, {
-        method: 'POST',
-        headers: this.headers('text/event-stream'),
-        body: JSON.stringify(payload),
-        signal: signal ? AbortSignal.any([signal, idle.signal]) : idle.signal,
-      });
+      // Повторяем только до начала ответа: сервер ещё ничего не прислал, частичного текста нет.
+      // Если сообщение всё же сохранилось, повтор создаст соседнюю ветку от того же parent_uuid — модель её не увидит
+      const response = await this.withRetry(() => {
+        idle.reset();
+        return fetch(`${this.baseUrl}/chat_api/v1/conversations/${conversationId}/messages`, {
+          method: 'POST',
+          headers: this.headers('text/event-stream'),
+          body,
+          signal: signal ? AbortSignal.any([signal, idle.signal]) : idle.signal,
+        });
+      }, signal);
       if (!response.ok || !response.body) {
         throw new ApiError(response.status, await safeText(response));
       }
@@ -289,25 +321,75 @@ export class NaparnikClient {
     const parser = new SseParser();
     const decoder = new TextDecoder('utf-8');
     let buffer = '';
+    let shown: string | undefined;
+    let shownAt = 0;
+    const showText = (force: boolean) => {
+      const now = Date.now();
+      if (!force && now - shownAt < TEXT_THROTTLE_MS) return;
+      const text = parser.visibleText;
+      if (text === shown) return;
+      shown = text;
+      shownAt = now;
+      callbacks.onText(text);
+    };
 
     // Читаем поток кусками и режем на строки: кусок может оборваться посреди строки
-    for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        // Таймер продлевают только события: «: heartbeat» сервер шлёт и тогда, когда сам завис
-        // (живой API: /init висел 26+ минут после TodoWrite — таймаут не срабатывал)
-        if (line.startsWith('data: ')) idle.reset();
-        parser.feedLine(line.replace(/\r$/, ''));
+    try {
+      for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          // Таймер продлевают только события: «: heartbeat» сервер шлёт и тогда, когда сам завис
+          // (живой API: /init висел 26+ минут после TodoWrite — таймаут не срабатывал)
+          if (line.startsWith('data: ')) idle.reset();
+          parser.feedLine(line.replace(/\r$/, ''));
+        }
+        // Первый текст — сразу, дальше — не чаще TEXT_THROTTLE_MS
+        showText(false);
       }
-      callbacks.onText(parser.visibleText);
+    } catch (err) {
+      // Соединение оборвалось посреди ответа (fetch: TypeError «terminated»). Остановка и таймаут — как есть
+      if (err instanceof TypeError) throw new StreamCutError();
+      throw err;
     }
     // Поток читаем до конца: после завершённого ответа сервер может продолжить следующим
+    buffer += decoder.decode();
     if (buffer) {
-      parser.feedLine(buffer);
+      parser.feedLine(buffer.replace(/\r$/, ''));
     }
+    showText(true);
+    // Поток закрыт, а ответ не завершён (finished не пришёл) — это обрыв, а не полный ответ
+    if (!parser.complete) throw new StreamCutError();
     return parser.result();
+  }
+
+  /**
+   * Запрос с повторами при временных сбоях: 429, 5xx и обрыв соединения до ответа.
+   * Пауза — Retry-After сервера или 1, 2, 4 с с разбросом. 401/403 и прочие ошибки не повторяются.
+   * Возвращает ответ сервера (в том числе неуспешный после последней попытки) — разбирает его вызывающий
+   */
+  private async withRetry(send: () => Promise<Response>, signal?: AbortSignal): Promise<Response> {
+    for (let attempt = 1; ; attempt++) {
+      let response: Response | undefined;
+      let failure: unknown;
+      try {
+        response = await send();
+      } catch (err) {
+        // fetch сообщает о сбое сети TypeError; остановка и таймаут — DOMException, их не повторяем
+        if (!(err instanceof TypeError) || signal?.aborted) throw err;
+        failure = err;
+      }
+      if (response && !RETRY_STATUSES.has(response.status)) return response;
+      const retryAfter = response ? parseRetryAfter(response.headers.get('retry-after')) : undefined;
+      if (attempt >= MAX_ATTEMPTS || (retryAfter ?? 0) > MAX_RETRY_AFTER_MS) {
+        if (response) return response;
+        throw failure;
+      }
+      await response?.body?.cancel().catch(() => undefined);
+      const base = (this.config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS) * 2 ** (attempt - 1);
+      await sleep(retryAfter ?? Math.min(base + Math.random() * base * 0.5, MAX_RETRY_DELAY_MS), signal);
+    }
   }
 
   /** Объединить пользовательскую отмену с таймаутом запроса */
@@ -339,6 +421,39 @@ class IdleTimeout {
   dispose(): void {
     clearTimeout(this.timer);
   }
+}
+
+/** Соединение оборвалось посреди ответа: показанный текст — только его часть */
+export class StreamCutError extends Error {
+  constructor() {
+    super('Соединение оборвалось до конца ответа — показана только его часть. Повторите вопрос.');
+    this.name = 'StreamCutError';
+  }
+}
+
+/** Retry-After: секунды или дата HTTP → миллисекунды */
+export function parseRetryAfter(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+}
+
+/** Пауза, которую прерывает остановка запроса */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 export class ApiError extends Error {

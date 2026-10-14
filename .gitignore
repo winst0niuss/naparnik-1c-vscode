@@ -4,3 +4,4 @@ out/
 .env
 CLAUDE.md
 .playwright-mcp/
+test-results/

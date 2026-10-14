@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { createServer, IncomingMessage, Server } from 'node:http';
 import { AddressInfo } from 'node:net';
-import { NaparnikClient, findTokenProblem } from '../api/client';
+import { NaparnikClient, STALLED_TEXT, StreamCutError, findTokenProblem, parseRetryAfter } from '../api/client';
 
 // Мок code.1c.ai: на каждый запрос отвечает функцией handler
 async function startMock(handler: (path: string, body: any, req: IncomingMessage) => { status?: number; sse?: object[]; json?: object }) {
@@ -31,6 +31,7 @@ async function startMock(handler: (path: string, body: any, req: IncomingMessage
     authFormat: 'plain',
     skillName: 'custom',
     timeoutMs: 5000,
+    retryDelayMs: 10,
   });
   return { client, requests, close: () => server.close() };
 }
@@ -123,6 +124,26 @@ test('пустой ответ после отклонённого инструм
     assert.equal(retry.role, 'user');
     assert.equal(retry.parent_uuid, 'asst-2');
     assert.equal(retry.content.content.instruction, 'продолжи командами');
+  } finally {
+    mock.close();
+  }
+});
+
+test('после подтверждения инструмента поток закрыт без ответа ассистента — пустой ответ (просим продолжить), а не обрыв', async () => {
+  let calls = 0;
+  const mock = await startMock((path) => {
+    if (path.endsWith('/conversations/')) return { json: { uuid: 'conv-1' } };
+    calls++;
+    if (calls === 1) return { sse: [{ role: 'assistant', uuid: 'asst-1', content: { tool_calls: [{ id: 'c-1', function: { name: 'TodoWrite' } }] }, finished: true }] };
+    if (calls === 2) return { sse: [{ role: 'tool', uuid: 'tool-1', content: { content: 'ok' }, finished: true }] };
+    return { sse: [{ role: 'assistant', uuid: 'asst-3', content: { content: 'Готово' }, finished: true }] };
+  });
+  try {
+    const id = await mock.client.createConversation();
+    const answer = await mock.client.sendMessage(id, 'Вопрос', undefined, { onText: () => {}, continueHint: 'продолжи' });
+    assert.equal(answer.text, 'Готово');
+    assert.equal(mock.requests[3].body.role, 'user');
+    assert.equal(mock.requests[3].body.parent_uuid, 'asst-1');
   } finally {
     mock.close();
   }
@@ -373,6 +394,27 @@ test('зацикливание после просьбы продолжить: �
   }
 });
 
+test('зацикливание не прекращается и после просьб продолжить: ответ stalled, а не ошибка лимита', async () => {
+  let calls = 0;
+  const mock = await startMock((path) => {
+    if (path.endsWith('/conversations/')) return { json: { uuid: 'conv-1' } };
+    calls++;
+    const call = { id: `c-${calls}`, function: { name: 'ReadSystemFile', arguments: '{"path":"NAPARNIK.md"}' } };
+    return { sse: [{ role: 'assistant', uuid: `asst-${calls}`, content: { tool_calls: [call] }, finished: true }] };
+  });
+  try {
+    const id = await mock.client.createConversation();
+    const answer = await mock.client.sendMessage(id, 'Вопрос', undefined, { onText: () => {}, emulateTool: async () => 'Файл не найден' });
+    assert.equal(answer.stalled, true);
+    assert.equal(answer.text, STALLED_TEXT);
+    assert.equal(answer.assistantUuid, `asst-${calls}`);
+    // Не до лимита раундов: три круга на каждую из трёх попыток (вопрос и две просьбы продолжить)
+    assert.ok(calls < 15, `запросов ${calls}`);
+  } finally {
+    mock.close();
+  }
+});
+
 test('сервер сам закрыл вызов инструмента и отверг ответ на него (422): просим продолжить, а не падаем', async () => {
   let messageCalls = 0;
   const mock = await startMock((path, body) => {
@@ -476,6 +518,131 @@ test('остановка пользователем во время выполн
     assert.equal(calls, 2);
   } finally {
     server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('503 и 429 до ответа повторяются, вопрос не теряется', async () => {
+  let calls = 0;
+  const mock = await startMock((path) => {
+    if (path.endsWith('/conversations/')) return { json: { uuid: 'conv-1' } };
+    calls++;
+    if (calls === 1) return { status: 503, json: { detail: 'down' } };
+    if (calls === 2) return { status: 429, json: { detail: 'slow down' } };
+    return { sse: [{ role: 'assistant', uuid: 'a-1', content: { content: 'Готово' }, finished: true }] };
+  });
+  try {
+    const answer = await mock.client.sendMessage('conv-1', 'Вопрос', undefined, { onText: () => {} });
+    assert.equal(answer.text, 'Готово');
+    const messages = mock.requests.filter((r) => r.path.endsWith('/messages'));
+    assert.equal(messages.length, 3);
+    // Повтор — тот же вопрос от того же родителя
+    assert.ok(messages.every((r) => r.body.content.content.instruction === 'Вопрос' && r.body.parent_uuid === null));
+  } finally {
+    mock.close();
+  }
+});
+
+test('401 не повторяется; постоянный 503 — ограниченное число попыток', async () => {
+  const unauthorized = await startMock(() => ({ status: 401, json: {} }));
+  const down = await startMock(() => ({ status: 503, json: { detail: 'down' } }));
+  try {
+    await assert.rejects(unauthorized.client.createConversation(), /Токен не принят/);
+    assert.equal(unauthorized.requests.length, 1);
+    await assert.rejects(down.client.createConversation(), /HTTP 503/);
+    assert.equal(down.requests.length, 4);
+  } finally {
+    unauthorized.close();
+    down.close();
+  }
+});
+
+test('Retry-After: секунды и дата; слишком долгое ожидание не повторяется', async () => {
+  assert.equal(parseRetryAfter('2'), 2000);
+  assert.equal(parseRetryAfter(null), undefined);
+  assert.ok((parseRetryAfter(new Date(Date.now() + 5000).toUTCString()) ?? 0) > 3000);
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls++;
+    res.writeHead(429, { 'Retry-After': '120' });
+    res.end('{}');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const client = new NaparnikClient({ token: 't', baseUrl: `http://127.0.0.1:${port}`, authFormat: 'plain', skillName: 'custom', timeoutMs: 5000 });
+  try {
+    await assert.rejects(client.createConversation(), /HTTP 429/);
+    assert.equal(calls, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test('сброс соединения до ответа повторяется', async () => {
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls++;
+    if (calls === 1) {
+      req.socket.destroy();
+      return;
+    }
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ uuid: 'conv-1' }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const client = new NaparnikClient({ token: 't', baseUrl: `http://127.0.0.1:${port}`, authFormat: 'plain', skillName: 'custom', timeoutMs: 5000, retryDelayMs: 10 });
+  try {
+    assert.equal(await client.createConversation(), 'conv-1');
+    assert.equal(calls, 2);
+  } finally {
+    server.close();
+  }
+});
+
+test('поток закрыт без finished или оборван — ошибка обрыва, без повтора, частичный текст показан', async () => {
+  const mock = await startMock(() => ({ sse: [{ role: 'assistant', uuid: 'a-1', content_delta: 'Начало ответа' }] }));
+  const cut = createServer((req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.write(`data: ${JSON.stringify({ role: 'assistant', uuid: 'a-1', content_delta: 'Часть' })}\n\n`);
+    setTimeout(() => req.socket.destroy(), 50);
+  });
+  await new Promise<void>((resolve) => cut.listen(0, '127.0.0.1', resolve));
+  const { port } = cut.address() as AddressInfo;
+  const cutClient = new NaparnikClient({ token: 't', baseUrl: `http://127.0.0.1:${port}`, authFormat: 'plain', skillName: 'custom', timeoutMs: 5000, retryDelayMs: 10 });
+  try {
+    const shown: string[] = [];
+    await assert.rejects(mock.client.sendMessage('c', 'q', undefined, { onText: (t) => shown.push(t) }), StreamCutError);
+    assert.equal(shown.at(-1), 'Начало ответа');
+    assert.equal(mock.requests.length, 1);
+    await assert.rejects(cutClient.sendMessage('c', 'q', undefined, { onText: () => {} }), StreamCutError);
+  } finally {
+    mock.close();
+    cut.close();
+  }
+});
+
+test('текст ответа отдаётся не на каждый кусок: первый сразу, итог — всегда', async () => {
+  const server = createServer(async (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.write(`data: ${JSON.stringify({ role: 'assistant', uuid: 'a-1', content_delta: 'x' })}\n\n`);
+    for (let i = 0; i < 200; i++) {
+      res.write(`data: ${JSON.stringify({ content_delta: 'y' })}\n\n`);
+      await new Promise((r) => setImmediate(r));
+    }
+    res.end(`data: ${JSON.stringify({ role: 'assistant', finished: true })}\n\n`);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const client = new NaparnikClient({ token: 't', baseUrl: `http://127.0.0.1:${port}`, authFormat: 'plain', skillName: 'custom', timeoutMs: 5000 });
+  try {
+    const shown: string[] = [];
+    const answer = await client.sendMessage('c', 'q', undefined, { onText: (t) => shown.push(t) });
+    assert.equal(answer.text, 'x' + 'y'.repeat(200));
+    assert.equal(shown[0].startsWith('x'), true);
+    assert.equal(shown.at(-1), answer.text);
+    assert.ok(shown.length < 100, `onText вызван ${shown.length} раз`);
+  } finally {
     server.close();
   }
 });

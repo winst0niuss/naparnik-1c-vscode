@@ -63,7 +63,7 @@ test('formatMentionedFiles: язык по расширению, обрезка �
   const r = formatMentionedFiles(many);
   assert.ok(r.skipped.length > 0);
   assert.ok(r.text.includes('Не приложены из-за объёма'));
-  assert.deepEqual(formatMentionedFiles([]), { text: '', skipped: [] });
+  assert.deepEqual(formatMentionedFiles([]), { text: '', skipped: [], hashes: {} });
 });
 
 test('withFolders: все папки путей с «/» на конце, без повторов', () => {
@@ -150,4 +150,28 @@ test('pluralFiles: склонение', () => {
   assert.deepEqual([1, 2, 5, 11, 12, 21, 22, 25, 111, 0].map(pluralFiles), [
     '1 файл', '2 файла', '5 файлов', '11 файлов', '12 файлов', '21 файл', '22 файла', '25 файлов', '111 файлов', '0 файлов',
   ]);
+});
+
+test('блок файлов: неизменённые — только в перечне, изменённый — целиком с пометкой, новый — целиком', () => {
+  const first = formatMentionedFiles([
+    { path: 'a.bsl', text: 'Процедура А()\nКонецПроцедуры' },
+    { path: 'b.bsl', text: 'Процедура Б()\nКонецПроцедуры' },
+  ]);
+  const second = formatMentionedFiles(
+    [
+      { path: 'a.bsl', text: 'Процедура А()\nКонецПроцедуры' },
+      { path: 'b.bsl', text: 'Процедура Б() // изменено\nКонецПроцедуры' },
+      { path: 'c.bsl', text: 'Процедура В()\nКонецПроцедуры' },
+    ],
+    [],
+    first.hashes,
+  );
+  assert.ok(second.text.startsWith('[Файлы, приложенные пользователем к вопросу (3): a.bsl, b.bsl, c.bsl.'));
+  assert.match(second.text, /Не изменились с прошлых сообщений \(1\), их содержимое — выше в чате: a\.bsl\./);
+  assert.ok(!second.text.includes('Процедура А()'), 'неизменённый файл отправлен снова');
+  assert.match(second.text, /--- b\.bsl \(изменён после прошлого сообщения\) ---/);
+  assert.match(second.text, /--- c\.bsl ---/);
+  // Ничего не изменилось — только перечень
+  const third = formatMentionedFiles([{ path: 'a.bsl', text: 'Процедура А()\nКонецПроцедуры' }], [], second.hashes);
+  assert.equal(third.text, '[Файлы, приложенные пользователем к вопросу (1): a.bsl. Не изменились с прошлых сообщений (1), их содержимое — выше в чате: a.bsl.]');
 });

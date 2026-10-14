@@ -39,3 +39,17 @@ test('история: пустые не сохраняются, новые св�
   await history.delete(second.id);
   assert.deepEqual(history.list().map((c) => c.title), ['первый']);
 });
+
+test('повреждённая история: не массив или битые записи не роняют список, целые чаты сохраняются', async () => {
+  const state = memento();
+  const history = new ChatHistory(state as any);
+  await state.update('naparnik.chats', { not: 'array' });
+  assert.deepEqual(history.list(), []);
+  await state.update('naparnik.chats', [null, 5, 'x', { id: 1 }, { id: 'ok', title: 't', updatedAt: 1, entries: [null, { role: 'user', text: 'q' }] }]);
+  const list = history.list();
+  assert.equal(list.length, 1);
+  assert.deepEqual(list[0].entries, [{ role: 'user', text: 'q' }]);
+  // Следующее сохранение вычищает повреждённое
+  await history.save({ ...createChat(), entries: [{ role: 'user', text: 'новый' }] });
+  assert.equal((state.get('naparnik.chats') as unknown[]).length, 2);
+});

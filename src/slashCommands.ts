@@ -49,7 +49,18 @@ export const PROJECT_DOC_DIRS = ['.cursor/rules', '.claude', '.codex', '.gemini'
 
 export const RULES_DIR = '.rules';
 
-/** Инструкция для /init */
+/** Инструкция для /init; exists — NAPARNIK.md уже есть: его обновляют, а не создают (@create_file откажет) */
+export function initPrompt(exists: boolean): string {
+  if (!exists) return INIT_PROMPT;
+  return INIT_PROMPT.replace(INIT_FIRST_LINE, 'Изучи проект и обнови файл NAPARNIK.md в корне — описание проекта для будущих чатов со мной.').replace(
+    INIT_WRITE_STEP,
+    '3. NAPARNIK.md уже есть — не создавай его заново. Прочитай его (@read_file NAPARNIK.md), затем исправь устаревшее и допиши недостающее блоками @edit_file (инструменты Edit и Write здесь не работают). Задача выполнена, только когда правка применена.',
+  );
+}
+
+const INIT_FIRST_LINE = 'Изучи проект и создай в корне файл NAPARNIK.md — описание проекта для будущих чатов со мной.';
+const INIT_WRITE_STEP = '3. Создай NAPARNIK.md командой @create_file (если файл уже есть — дополни его через @edit_file). Задача выполнена, только когда файл создан.';
+
 export const INIT_PROMPT = `Изучи проект и создай в корне файл NAPARNIK.md — описание проекта для будущих чатов со мной.
 
 Порядок:

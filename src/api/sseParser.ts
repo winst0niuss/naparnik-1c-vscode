@@ -40,6 +40,8 @@ export class SseParser {
   private usage: ContextUsage | undefined;
   // Ответ ассистента завершён (finished), но поток может продолжиться следующим ответом
   private messageFinished = false;
+  // Пришло хоть одно событие ответа ассистента
+  private started = false;
 
   /** Обработать одну строку SSE-потока */
   feedLine(line: string): void {
@@ -62,6 +64,7 @@ export class SseParser {
     if (this.messageFinished) {
       this.reset();
     }
+    this.started = true;
     if (data.role === 'assistant' && data.uuid) {
       this.assistantUuid = data.uuid;
     }
@@ -113,6 +116,14 @@ export class SseParser {
     this.assistantUuid = undefined;
     this.usage = undefined;
     this.messageFinished = false;
+  }
+
+  /**
+   * Поток не оборван посреди ответа: последний ответ ассистента завершён (finished) или его не было вовсе.
+   * Без ответа сервер закрывает поток после результата инструмента (живой API, /init) — это пустой ответ, а не обрыв
+   */
+  get complete(): boolean {
+    return this.messageFinished || !this.started;
   }
 
   /** Текст, который можно показывать пользователю прямо сейчас (без thinking-блоков) */

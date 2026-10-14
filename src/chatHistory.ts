@@ -5,6 +5,8 @@ export interface ChatEntry {
   // step — шаг работы с проектом («Читаю …»); compact — пересказ, которым заменили историю (/compact)
   role: 'user' | 'assistant' | 'error' | 'step' | 'compact';
   text: string;
+  /** Ответ прерван (остановка, обрыв, ошибка): текст показан пользователю, но модель его не помнит */
+  interrupted?: boolean;
   /** Для сообщения пользователя: какой файл редактора был приложен («chatHistory.ts · строки 10–24»); для пересказа — как сжат */
   context?: string;
 }
@@ -19,8 +21,8 @@ export interface SavedChat {
   lastAssistantUuid?: string;
   /** Хеш последнего отправленного контекста редактора — чтобы не слать тот же неизменённый файл повторно */
   lastEditorContext?: string;
-  /** Хеш последнего отправленного блока приложенных файлов — чипы остаются, неизменённое повторно не шлём */
-  lastAttachments?: string;
+  /** Хеши приложенных файлов, уже отправленных в этой дискуссии (путь → хеш): неизменённые повторно не шлём */
+  sentFiles?: Record<string, string>;
   /** Чипы контекста этого чата — пути от корня, папки с «/», фрагменты «путь#L120-180» */
   attachments?: string[];
   /** Модели уже отправлена инструкция по командам работы с проектом */
@@ -45,9 +47,13 @@ const TITLE_LENGTH = 60;
 export class ChatHistory {
   constructor(private readonly state: vscode.Memento) {}
 
-  /** Чаты от новых к старым */
+  /** Чаты от новых к старым. Повреждённые записи пропускаются — при следующем сохранении они исчезнут */
   list(): SavedChat[] {
-    return [...this.state.get<SavedChat[]>(STORAGE_KEY, [])].sort((a, b) => b.updatedAt - a.updatedAt);
+    const raw = this.state.get<unknown>(STORAGE_KEY, []);
+    const chats = Array.isArray(raw) ? raw.filter(isSavedChat) : [];
+    return chats
+      .map((chat) => ((chat.entries as unknown[]).every(isChatEntry) ? chat : { ...chat, entries: chat.entries.filter(isChatEntry) }))
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   }
 
   /** touch = false — сохранить без смены времени (например, изменились только чипы), порядок истории тот же */
@@ -70,6 +76,16 @@ export class ChatHistory {
   async clear(): Promise<void> {
     await this.state.update(STORAGE_KEY, []);
   }
+}
+
+function isSavedChat(value: unknown): value is SavedChat {
+  const chat = value as SavedChat | null;
+  return typeof chat === 'object' && chat !== null && typeof chat.id === 'string' && Array.isArray(chat.entries);
+}
+
+function isChatEntry(value: unknown): value is ChatEntry {
+  const entry = value as ChatEntry | null;
+  return typeof entry === 'object' && entry !== null && typeof entry.role === 'string' && typeof entry.text === 'string';
 }
 
 export function createChat(): SavedChat {

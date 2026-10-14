@@ -226,6 +226,7 @@
     "compile": "tsc -p .",
     "watch": "tsc -watch -p .",
     "test": "npm run compile && node --test \"out/test/**/*.test.js\"",
+    "test:live": "npm run compile && node out/test-live/run.js",
     "package": "vsce package",
     "publish:vscode": "vsce publish",
     "publish:openvsx": "npx ovsx publish"

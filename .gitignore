@@ -2,6 +2,9 @@ node_modules/
 out/
 *.vsix
 .env
-CLAUDE.md
+# Личные инструкции, разрешения и рабочие копии агентов
+CLAUDE.local.md
+**/.claude/settings.local.json
+**/.claude/worktrees/
 .playwright-mcp/
 test-results/

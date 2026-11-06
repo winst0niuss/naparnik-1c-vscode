@@ -119,6 +119,12 @@ npm run package   # собрать .vsix
 
 Отладка: F5 в VS Code.
 
+### Codex и Claude Code
+
+Открывайте корень репозитория в Codex или Claude Code. Общие инструкции находятся в [AGENTS.md](AGENTS.md): Codex загружает их как проектные правила, а [CLAUDE.md](CLAUDE.md) подключает тот же файл через `@AGENTS.md`. Такой порядок описан в документации [Codex](https://learn.chatgpt.com/docs/agent-configuration/agents-md) и [Claude Code](https://code.claude.com/docs/en/memory). Дополнительная конфигурация агента для проекта не требуется.
+
+Архитектура, особенности API и проверок описаны в [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Сохраняйте там общие технические знания, чтобы они были доступны обоим инструментам после клонирования. Личные разрешения и токены настраиваются отдельно для каждого инструмента; `.claude/settings.local.json` не хранится в Git. Инструкции агентов и документация разработки не входят в `.vsix`.
+
 ---
 
 ## Правовая информация

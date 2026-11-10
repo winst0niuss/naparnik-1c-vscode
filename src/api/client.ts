@@ -294,20 +294,26 @@ export class NaparnikClient {
     signal?: AbortSignal,
   ): Promise<SseParseResult> {
     // Таймаут — на паузу в данных, а не на весь ответ: длинный, но идущий ответ не обрываем
-    const idle = new IdleTimeout(this.config.timeoutMs);
+    let idle = new IdleTimeout(this.config.timeoutMs);
     const body = JSON.stringify(payload);
     try {
       // Повторяем только до начала ответа: сервер ещё ничего не прислал, частичного текста нет.
       // Если сообщение всё же сохранилось, повтор создаст соседнюю ветку от того же parent_uuid — модель её не увидит
-      const response = await this.withRetry(() => {
-        idle.reset();
-        return fetch(`${this.baseUrl}/chat_api/v1/conversations/${conversationId}/messages`, {
-          method: 'POST',
-          headers: this.headers('text/event-stream'),
-          body,
-          signal: signal ? AbortSignal.any([signal, idle.signal]) : idle.signal,
-        });
-      }, signal);
+      const response = await this.withRetry(
+        () => {
+          // Каждая попытка получает новый сигнал; пауза перед повтором не расходует её таймаут.
+          idle.dispose();
+          idle = new IdleTimeout(this.config.timeoutMs);
+          return fetch(`${this.baseUrl}/chat_api/v1/conversations/${conversationId}/messages`, {
+            method: 'POST',
+            headers: this.headers('text/event-stream'),
+            body,
+            signal: signal ? AbortSignal.any([signal, idle.signal]) : idle.signal,
+          });
+        },
+        signal,
+        () => idle.dispose(),
+      );
       if (!response.ok || !response.body) {
         throw new ApiError(response.status, await safeText(response));
       }
@@ -349,6 +355,8 @@ export class NaparnikClient {
         showText(false);
       }
     } catch (err) {
+      // Последние события могли ещё не попасть в чат из-за ограничения частоты обновлений.
+      showText(true);
       // Соединение оборвалось посреди ответа (fetch: TypeError «terminated»). Остановка и таймаут — как есть
       if (err instanceof TypeError) throw new StreamCutError();
       throw err;
@@ -369,7 +377,7 @@ export class NaparnikClient {
    * Пауза — Retry-After сервера или 1, 2, 4 с с разбросом. 401/403 и прочие ошибки не повторяются.
    * Возвращает ответ сервера (в том числе неуспешный после последней попытки) — разбирает его вызывающий
    */
-  private async withRetry(send: () => Promise<Response>, signal?: AbortSignal): Promise<Response> {
+  private async withRetry(send: () => Promise<Response>, signal?: AbortSignal, beforeRetry?: () => void): Promise<Response> {
     for (let attempt = 1; ; attempt++) {
       let response: Response | undefined;
       let failure: unknown;
@@ -386,6 +394,7 @@ export class NaparnikClient {
         if (response) return response;
         throw failure;
       }
+      beforeRetry?.();
       await response?.body?.cancel().catch(() => undefined);
       const base = (this.config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS) * 2 ** (attempt - 1);
       await sleep(retryAfter ?? Math.min(base + Math.random() * base * 0.5, MAX_RETRY_DELAY_MS), signal);

@@ -16,6 +16,7 @@ import * as path from 'node:path';
 import { LiveProxy } from './proxy';
 import { ProxyControl, ScenarioMetric, mask, percentile, runScenarios } from './common';
 import { apiScenarios, faultScenarios } from './nodeScenarios';
+import { makeCopy } from './projectCopy';
 
 const DEFAULT_PROJECTS = ['/Users/user/Разработка/other/taiko_pixel', '/Users/user/Разработка/g5/g5-autotests'];
 const WORK_DIR = '/tmp/naparnik-test';
@@ -36,21 +37,6 @@ const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-C', cwd, 
 /** Состояние оригинала — сверяется до и после прогона */
 function originalState(dir: string): string {
   return [`status:\n${git(dir, 'status', '--porcelain')}`, `HEAD ${git(dir, 'rev-parse', 'HEAD')}`, `branch ${git(dir, 'branch', '--show-current')}`, `stash:\n${git(dir, 'stash', 'list')}`].join('\n');
-}
-
-async function makeCopy(original: string): Promise<string> {
-  const copy = path.join(WORK_DIR, path.basename(original));
-  await fs.rm(copy, { recursive: true, force: true });
-  await fs.mkdir(WORK_DIR, { recursive: true });
-  // APFS-клон (cp -c): копия мгновенная и не занимает места, пока файлы не изменены
-  try {
-    execFileSync('cp', ['-cR', original, copy]);
-  } catch {
-    execFileSync('cp', ['-R', original, copy]);
-  }
-  for (const remote of git(copy, 'remote').split('\n').filter(Boolean)) git(copy, 'remote', 'remove', remote);
-  if (git(copy, 'remote', '-v') !== '') throw new Error(`в копии ${copy} остались git remote — прогон остановлен до запросов к API`);
-  return copy;
 }
 
 async function runVsCode(copy: string, project: string, proxyUrl: string, groups: string[], only: string | undefined): Promise<ScenarioMetric[]> {
@@ -154,7 +140,7 @@ async function main(): Promise<void> {
       if (!vsGroups.length) break;
       const project = path.basename(original);
       console.log(`\nПроект ${project}: копия и VS Code…`);
-      const copy = await makeCopy(original);
+      const copy = await makeCopy(original, WORK_DIR);
       try {
         metrics.push(...(await runVsCode(copy, project, proxyUrl, vsGroups, only)));
       } finally {
